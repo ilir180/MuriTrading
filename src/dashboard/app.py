@@ -223,12 +223,23 @@ def fetch_live_candles(timeframe, limit):
             candles = exchange.fetch_ohlcv(SYMBOL, timeframe=timeframe, limit=limit)
         except Exception:
             pass
-    # Fallback: direkte Binance REST API
+    # Fallback: direkte Binance REST API (mehrere Endpunkte)
     if candles is None:
-        url = "https://api.binance.com/api/v3/klines"
-        resp = _requests.get(url, params={"symbol": "XRPUSDT", "interval": timeframe, "limit": limit}, timeout=15)
-        resp.raise_for_status()
-        candles = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in resp.json()]
+        binance_urls = [
+            "https://data-api.binance.vision/api/v3/klines",
+            "https://api.binance.com/api/v3/klines",
+            "https://api.binance.us/api/v3/klines",
+        ]
+        for url in binance_urls:
+            try:
+                resp = _requests.get(url, params={"symbol": "XRPUSDT", "interval": timeframe, "limit": limit}, timeout=15)
+                resp.raise_for_status()
+                candles = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in resp.json()]
+                break
+            except Exception:
+                continue
+        if candles is None:
+            raise Exception("Alle Binance-Endpunkte fehlgeschlagen")
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.set_index("datetime").drop(columns=["timestamp"])
