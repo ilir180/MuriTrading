@@ -20,7 +20,8 @@ from plotly.subplots import make_subplots
 import streamlit.components.v1 as components
 
 # ── Projekt-Root für Imports ───────────────────────────────────
-PROJECT_ROOT = os.path.expanduser("~/MuriTrading")
+# Lokal: ~/MuriTrading, Streamlit Cloud: /mount/src/muritrading
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 from src.features.build_features import add_indicators
 
