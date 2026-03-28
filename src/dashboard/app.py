@@ -11,9 +11,14 @@ import pickle
 import json
 import os
 import sys
-import ccxt
+import requests as _requests
 import time as _time
 from datetime import datetime, timezone
+
+try:
+    import ccxt
+except ImportError:
+    ccxt = None
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -210,14 +215,18 @@ def load_models():
 @st.cache_data(ttl=30)
 def fetch_live_candles(timeframe, limit):
     """Holt Kerzen - versucht ccxt, Fallback auf Binance REST API."""
-    try:
-        exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
-        candles = exchange.fetch_ohlcv(SYMBOL, timeframe=timeframe, limit=limit)
-    except Exception:
-        # Fallback: direkte Binance REST API (funktioniert auch auf US-Servern)
-        import requests as _req
+    candles = None
+    # Versuch 1: ccxt
+    if ccxt is not None:
+        try:
+            exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+            candles = exchange.fetch_ohlcv(SYMBOL, timeframe=timeframe, limit=limit)
+        except Exception:
+            pass
+    # Fallback: direkte Binance REST API
+    if candles is None:
         url = "https://api.binance.com/api/v3/klines"
-        resp = _req.get(url, params={"symbol": "XRPUSDT", "interval": timeframe, "limit": limit}, timeout=15)
+        resp = _requests.get(url, params={"symbol": "XRPUSDT", "interval": timeframe, "limit": limit}, timeout=15)
         resp.raise_for_status()
         candles = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in resp.json()]
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
