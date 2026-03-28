@@ -207,17 +207,19 @@ def load_models():
     return rf, xgb, meta
 
 
-def get_exchange():
-    return ccxt.binance({
-        "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
-
-
 @st.cache_data(ttl=30)
 def fetch_live_candles(timeframe, limit):
-    exchange = get_exchange()
-    candles = exchange.fetch_ohlcv(SYMBOL, timeframe=timeframe, limit=limit)
+    """Holt Kerzen - versucht ccxt, Fallback auf Binance REST API."""
+    try:
+        exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+        candles = exchange.fetch_ohlcv(SYMBOL, timeframe=timeframe, limit=limit)
+    except Exception:
+        # Fallback: direkte Binance REST API (funktioniert auch auf US-Servern)
+        import requests as _req
+        url = "https://api.binance.com/api/v3/klines"
+        resp = _req.get(url, params={"symbol": "XRPUSDT", "interval": timeframe, "limit": limit}, timeout=15)
+        resp.raise_for_status()
+        candles = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in resp.json()]
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.set_index("datetime").drop(columns=["timestamp"])
