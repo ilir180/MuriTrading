@@ -580,6 +580,46 @@ def main():
     """, height=280)
 
     # ══════════════════════════════════════════════════════════
+    #  BOT STATUS (liest dashboard_status.json)
+    # ══════════════════════════════════════════════════════════
+    bot_status_file = os.path.join(PROJECT_ROOT, "data", "bot", "dashboard_status.json")
+    if os.path.exists(bot_status_file):
+        try:
+            with open(bot_status_file) as f:
+                bot_st = json.load(f)
+            bot_update = bot_st.get("last_update", "–")[:19]
+            pool_rows = ""
+            for pname, pdata in bot_st.get("pools", {}).items():
+                wr = f"{pdata['win_rate']:.0%}" if pdata.get("win_rate") is not None else "–"
+                pnl_col = "c-green" if pdata.get("total_pnl", 0) >= 0 else "c-red"
+                today_col = "c-green" if pdata.get("today_pnl", 0) >= 0 else "c-red"
+                pool_rows += f"""<tr>
+                    <td style="font-weight:600">{pdata.get('emoji','')} {pdata.get('label','')}</td>
+                    <td style="font-family:monospace;color:#e2e8f0">${pdata.get('capital',0):.2f}</td>
+                    <td class="{pnl_col}" style="font-family:monospace">{pdata.get('total_pnl',0):+.2f}$</td>
+                    <td class="{today_col}" style="font-family:monospace">{pdata.get('today_pnl',0):+.2f}$</td>
+                    <td style="font-family:monospace;color:#c084fc">{pdata.get('total_trades',0)}</td>
+                    <td style="font-family:monospace;color:#38bdf8">{wr}</td>
+                    <td style="font-family:monospace;color:#e2e8f0">{pdata.get('open_positions',0)}</td>
+                </tr>"""
+
+            render_html(f"""
+            <div class="section-header">Bot Status &middot; Live Paper Trading</div>
+            <div class="notice-box">
+                <strong>Bot aktiv</strong> &middot; Letztes Update: {bot_update} UTC
+            </div>
+            <table class="mtf-table">
+              <thead><tr>
+                <th>Topf</th><th>Kapital</th><th>PnL Gesamt</th><th>PnL Heute</th>
+                <th>Trades</th><th>Win Rate</th><th>Offen</th>
+              </tr></thead>
+              <tbody>{pool_rows}</tbody>
+            </table>
+            """, height=260)
+        except Exception:
+            pass
+
+    # ══════════════════════════════════════════════════════════
     #  EXPANDABLE DETAILS (als HTML-Tabellen im Dark Style)
     # ══════════════════════════════════════════════════════════
     with st.expander("Feature-Details (Top 20)"):

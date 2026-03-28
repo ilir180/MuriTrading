@@ -42,6 +42,9 @@ ROUND_TRIP       = (TAKER_FEE + SLIPPAGE) * 2
 STOP_LOSS_MULT   = 1.5
 HOLD_CANDLES     = 2
 CHECK_INTERVAL   = 60
+DAILY_REPORT_HOUR= 22          # UTC - täglicher Report
+RETRAIN_WINDOW   = 50          # Letzte N Signale für Performance-Check
+RETRAIN_THRESHOLD= 0.60        # Unter dieser Accuracy → Warnung
 
 # ── Die drei Töpfe ────────────────────────────────────────────
 POOLS = {
@@ -73,6 +76,141 @@ def tg_send(text):
 # ═══════════════════════════════════════════════════════════════
 #  TERMINAL STYLING
 # ═══════════════════════════════════════════════════════════════
+
+def send_daily_report(pools, signals, start_time):
+    """Sendet tägliche Zusammenfassung per Telegram."""
+    now = datetime.now(timezone.utc)
+    uptime = now - start_time
+    hours = int(uptime.total_seconds() // 3600)
+    today = now.date().isoformat()
+
+    # Stärkstes Signal des Tages
+    today_signals = [s for s in signals if s.get("timestamp", "").startswith(today)]
+    max_conf = max((s.get("confidence", 0) for s in today_signals), default=0)
+    n_signals = len(today_signals)
+
+    # Fear & Greed live holen
+    fg_text = ""
+    try:
+        resp = _requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        fg = resp.json()["data"][0]
+        fg_text = f"\nFear & Greed: <code>{fg['value']}</code> ({fg['value_classification']})"
+    except Exception:
+        pass
+
+    # Pool-Status
+    pool_lines = ""
+    total_pnl = 0
+    for name, pool in pools.items():
+        cfg = POOLS[name]
+        wr = f"{pool.win_rate:.0%}" if pool.n_trades > 0 else "–"
+        today_trades = len([t for t in pool.trades if t.get("timestamp", "").startswith(today)])
+        total_pnl += pool.total_pnl
+        pool_lines += (
+            f"{cfg['emoji']} <b>{cfg['label']}</b>: "
+            f"<code>${pool.capital:.2f}</code> "
+            f"({pool.total_pnl:+.2f}$) "
+            f"WR:{wr} "
+            f"Trades heute: {today_trades}\n"
+        )
+
+    tg_send(
+        f"\U0001F4CB <b>Täglicher Report</b> – {today}\n\n"
+        f"Uptime: <code>{hours}h</code>\n"
+        f"Signale heute: <code>{n_signals}</code>\n"
+        f"Stärkstes Signal: <code>{max_conf:.0%}</code>\n"
+        f"{fg_text}\n\n"
+        f"{pool_lines}\n"
+        f"Gesamt PnL: <code>{total_pnl:+.2f}$</code>"
+    )
+
+
+def check_retrain_needed(signals, pools):
+    """Prüft ob das Modell schlecht performt und Retrain nötig ist."""
+    if len(signals) < RETRAIN_WINDOW:
+        return
+
+    recent = signals[-RETRAIN_WINDOW:]
+    # Nur Signale mit Trade prüfen (aggressiv hat die meisten)
+    traded = [s for s in recent if s.get("aggressiv_traded", False)]
+    if len(traded) < 20:
+        return
+
+    # Vergleiche Signal-Richtung mit tatsächlicher Preisbewegung
+    correct = 0
+    total = 0
+    for i, s in enumerate(traded):
+        if i + 2 >= len(signals):
+            break
+        # Finde den Preis 2 Signale später
+        future_idx = signals.index(s) + 2
+        if future_idx >= len(signals):
+            break
+        future_price = signals[future_idx].get("price", 0)
+        entry_price = s.get("price", 0)
+        if entry_price == 0 or future_price == 0:
+            continue
+
+        actual_dir = "long" if future_price > entry_price else "short"
+        predicted_dir = s.get("aggressiv_signal", "neutral")
+        if predicted_dir == "neutral":
+            continue
+
+        total += 1
+        if predicted_dir == actual_dir:
+            correct += 1
+
+    if total >= 15:
+        accuracy = correct / total
+        if accuracy < RETRAIN_THRESHOLD:
+            tg_send(
+                f"\u26A0\uFE0F <b>Retrain-Warnung</b>\n\n"
+                f"Modell-Accuracy der letzten {total} Signale: "
+                f"<code>{accuracy:.0%}</code>\n"
+                f"Schwelle: <code>{RETRAIN_THRESHOLD:.0%}</code>\n\n"
+                f"Empfehlung: Modell neu trainieren mit frischen Daten."
+            )
+            return True
+    return False
+
+
+def save_dashboard_status(pools, signals, ensemble_prob=None, confidence=None, price=None):
+    """Speichert Bot-Status als JSON fürs Dashboard."""
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+
+    status = {
+        "bot_running": True,
+        "last_update": now.isoformat(),
+        "current_price": price,
+        "ensemble_prob": ensemble_prob,
+        "confidence": confidence,
+        "pools": {},
+    }
+    for name, pool in pools.items():
+        cfg = POOLS[name]
+        today_trades = [t for t in pool.trades if t.get("timestamp", "").startswith(today)]
+        today_pnl = sum(t.get("pnl", 0) for t in today_trades)
+        wr = pool.win_rate if pool.n_trades > 0 else None
+        status["pools"][name] = {
+            "label": cfg["label"],
+            "emoji": cfg["emoji"],
+            "capital": round(pool.capital, 2),
+            "total_pnl": round(pool.total_pnl, 2),
+            "today_pnl": round(today_pnl, 2),
+            "today_trades": len(today_trades),
+            "total_trades": pool.n_trades,
+            "wins": pool.wins,
+            "losses": pool.losses,
+            "win_rate": round(wr, 4) if wr is not None else None,
+            "max_dd": round(pool.max_dd, 4),
+            "open_positions": len(pool.open_positions),
+        }
+
+    status_file = os.path.join(BOT_DIR, "dashboard_status.json")
+    with open(status_file, "w") as f:
+        json.dump(status, f, indent=2, default=str)
+
 
 class C:
     PURPLE = "\033[95m"
@@ -412,6 +550,8 @@ def main():
     )
 
     last_candle_time = None
+    last_daily_report = None
+    start_time = datetime.now(timezone.utc)
 
     while running[0]:
         try:
@@ -419,6 +559,14 @@ def main():
             current_price = ticker["last"]
             now = datetime.now(timezone.utc)
             current_hour = now.replace(minute=0, second=0, microsecond=0)
+
+            # Täglicher Report um 22:00 UTC
+            today_key = now.date().isoformat()
+            if now.hour == DAILY_REPORT_HOUR and last_daily_report != today_key:
+                last_daily_report = today_key
+                send_daily_report(pools, signals, start_time)
+                check_retrain_needed(signals, pools)
+                log("Täglicher Report gesendet", C.BLUE)
 
             # Exits prüfen (jede Iteration)
             for name, pool in pools.items():
@@ -533,6 +681,8 @@ def main():
                     sig_row[f"{name}_traded"] = name in traded_pools
                 signals.append(sig_row)
 
+                # Dashboard-Status + State speichern
+                save_dashboard_status(pools, signals, ensemble_prob, confidence, current_price)
                 save_state(pools, signals, equity)
 
             time.sleep(CHECK_INTERVAL)
