@@ -121,6 +121,52 @@ def add_indicators(df, prefix=""):
     df[f"{p}upper_wick"]   = (h - c.clip(lower=df["open"])) / (h - l + 1e-10)
     df[f"{p}lower_wick"]   = (c.clip(upper=df["open"]) - l) / (h - l + 1e-10)
 
+    # ── Regime-Detection Features ──────────────────────────────
+    # ADX (Average Directional Index) – Trendstärke 0-100
+    plus_dm = h.diff().clip(lower=0)
+    minus_dm = (-l.diff()).clip(lower=0)
+    # Wenn +DM < -DM, dann +DM = 0 und umgekehrt
+    plus_dm[plus_dm < minus_dm] = 0
+    minus_dm[minus_dm < plus_dm] = 0
+    atr_14 = df[f"{p}atr_14"]
+    plus_di = 100 * (plus_dm.ewm(alpha=1/14, adjust=False).mean() / (atr_14 + 1e-10))
+    minus_di = 100 * (minus_dm.ewm(alpha=1/14, adjust=False).mean() / (atr_14 + 1e-10))
+    dx = (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10) * 100
+    df[f"{p}adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
+    df[f"{p}plus_di"] = plus_di
+    df[f"{p}minus_di"] = minus_di
+
+    # Choppiness Index – misst ob Markt trending (niedrig) oder seitwärts (hoch)
+    atr_sum_14 = df[f"{p}atr_14"].rolling(14).sum()
+    high_14 = h.rolling(14).max()
+    low_14 = l.rolling(14).min()
+    df[f"{p}chop"] = np.log10(atr_sum_14 / (high_14 - low_14 + 1e-10)) / np.log10(14)
+
+    # Volatilitäts-Regime: ATR relativ zum rollenden Durchschnitt
+    atr_ma = df[f"{p}atr_rel"].rolling(50).mean()
+    atr_std = df[f"{p}atr_rel"].rolling(50).std()
+    df[f"{p}vol_regime"] = (df[f"{p}atr_rel"] - atr_ma) / (atr_std + 1e-10)  # z-score
+
+    # Bollinger Bandwidth Squeeze – niedrige BB-Width = Seitwärts/Konsolidierung
+    bb_width_ma = df[f"{p}bb_width"].rolling(50).mean()
+    df[f"{p}bb_squeeze"] = df[f"{p}bb_width"] / (bb_width_ma + 1e-10)
+
+    # Trend-Konsistenz: wie konsistent ist die Richtung in den letzten N Kerzen?
+    # Hoher Wert = klarer Trend, niedriger Wert = hin und her
+    ret = c.pct_change()
+    pos_sum = ret.clip(lower=0).rolling(20).sum()
+    neg_sum = ret.clip(upper=0).abs().rolling(20).sum()
+    total_move = pos_sum + neg_sum
+    df[f"{p}trend_consistency"] = (pos_sum - neg_sum).abs() / (total_move + 1e-10)
+
+    # Zusammenfassendes Regime-Signal: 0=seitwärts, 1=trending
+    # ADX > 25 UND Choppiness < 0.5 UND BB nicht squeezed = Trend
+    df[f"{p}regime_trend"] = (
+        (df[f"{p}adx"] > 25) &
+        (df[f"{p}chop"] < 0.5) &
+        (df[f"{p}bb_squeeze"] > 0.8)
+    ).astype(int)
+
     return df
 
 
