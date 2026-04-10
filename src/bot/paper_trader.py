@@ -32,6 +32,7 @@ from datetime import datetime, timezone, timedelta
 PROJECT_ROOT = os.path.expanduser("~/MuriTrading")
 sys.path.insert(0, PROJECT_ROOT)
 from src.features.build_features import add_indicators
+from src.features.whale_features import compute_whale_features, whale_signal_text
 
 # ── Pfade ──────────────────────────────────────────────────────
 MODEL_DIR   = os.path.join(PROJECT_ROOT, "models")
@@ -406,7 +407,7 @@ class Pool:
         return pos
 
     def check_exits(self, current_price):
-        """Prüft Stop-Loss und Haltezeit."""
+        """Prüft Stop-Loss, Take-Profit und Haltezeit."""
         closed = []
         for pos in self.open_positions:
             pos["candles_held"] = pos.get("candles_held", 0) + 1
@@ -414,9 +415,21 @@ class Pool:
             hit_sl = (pos["direction"] == "long" and current_price <= pos["stop_loss"]) or \
                      (pos["direction"] == "short" and current_price >= pos["stop_loss"])
 
+            # Take-Profit: 2x die SL-Distanz
+            sl_dist = abs(pos["entry_price"] - pos["stop_loss"])
+            if pos["direction"] == "long":
+                tp = pos["entry_price"] + sl_dist * 2.0
+                hit_tp = current_price >= tp
+            else:
+                tp = pos["entry_price"] - sl_dist * 2.0
+                hit_tp = current_price <= tp
+
             if hit_sl:
                 pnl = self._close(pos, current_price, "stop_loss")
                 closed.append((pos, pnl, "STOP-LOSS"))
+            elif hit_tp:
+                pnl = self._close(pos, current_price, "take_profit")
+                closed.append((pos, pnl, "TAKE-PROFIT \U0001F3AF"))
             elif pos["candles_held"] >= HOLD_CANDLES:
                 pnl = self._close(pos, current_price, "time_exit")
                 closed.append((pos, pnl, "TIME-EXIT"))
@@ -527,17 +540,26 @@ class RLPool(Pool):
 
         obs = np.concatenate(parts).astype(np.float32)
 
-        # Agent fragen
-        action, _ = self.rl_model.predict(obs, deterministic=True)
-        return float(np.clip(action[0], -1.0, 1.0))
+        # Agent fragen + Confidence messen
+        import torch
+        obs_tensor = torch.as_tensor(obs).unsqueeze(0)
+        with torch.no_grad():
+            dist = self.rl_model.policy.get_distribution(obs_tensor)
+            action_mean = dist.distribution.mean.cpu().numpy().flatten()
+            action_std = dist.distribution.scale.cpu().numpy().flatten()
+
+        action_val = float(np.clip(action_mean[0], -1.0, 1.0))
+        # Confidence: niedrige Std = hohe Sicherheit
+        confidence = max(0.0, 1.0 - action_std[0] / 0.5)
+        return action_val, confidence
 
     def process_rl_signal(self, target_position, current_price, atr_rel):
         """Verarbeitet RL-Entscheidung und eröffnet/schliesst Trades."""
         position_change = target_position - self.position_state
         actions = []  # Liste von (action_type, details)
 
-        # Nur handeln bei signifikanter Änderung
-        if abs(position_change) <= 0.10:
+        # Nur handeln bei signifikanter Änderung (0.25 statt 0.10 = stärkere Überzeugung nötig)
+        if abs(position_change) <= 0.25:
             return actions
 
         # Alte Position schliessen
@@ -547,7 +569,7 @@ class RLPool(Pool):
             actions.extend(closed)
 
         # Neue Position eröffnen
-        if abs(target_position) > 0.10:
+        if abs(target_position) > 0.25:
             direction = "long" if target_position > 0 else "short"
             # Position Size basiert auf RL Agent's Überzeugung
             size_factor = abs(target_position)  # 0-1
@@ -555,7 +577,8 @@ class RLPool(Pool):
 
             today = datetime.now(timezone.utc).date().isoformat()
             self.daily_trades[today] = self.daily_trades.get(today, 0)
-            if self.daily_trades[today] < MAX_TRADES_PER_DAY:
+            rl_max_daily = 3  # RL Agent: max 3 Trades/Tag (konservativer)
+            if self.daily_trades[today] < rl_max_daily:
                 stop_loss_pct = max(atr_rel * STOP_LOSS_MULT, 0.001)
                 sl = current_price * (1 - stop_loss_pct) if direction == "long" else current_price * (1 + stop_loss_pct)
 
@@ -763,6 +786,39 @@ def main():
                 ensemble_prob, rf_prob, xgb_prob = predict(rf, xgb, X)
                 confidence = abs(ensemble_prob - 0.5) * 2
 
+                # Whale-Features (Orderbuch + grosse Trades)
+                whale = compute_whale_features()
+                whale_txt = whale_signal_text(whale)
+                import math
+                whale_ok = not math.isnan(whale.get("whale_bid_ask_imbalance", float("nan")))
+
+                # Whale-Adjustments auf ML Ensemble
+                if whale_ok:
+                    imb = whale["whale_bid_ask_imbalance"]
+                    net_norm = whale.get("whale_net_flow_normalized", 0) or 0
+                    dr1 = whale.get("whale_depth_ratio_1pct", 1.0) or 1.0
+
+                    # Starker Whale-Kaufdruck → Ensemble leicht Richtung Long boosten
+                    if net_norm > 0.3 and imb > 0.6 and dr1 > 1.5:
+                        ensemble_prob = min(ensemble_prob + 0.05, 0.95)
+                    elif net_norm < -0.3 and imb < 0.4 and dr1 < 0.67:
+                        ensemble_prob = max(ensemble_prob - 0.05, 0.05)
+
+                    # Ask-Wall Absorption → bullish breakout
+                    if whale.get("whale_absorption_ask"):
+                        ensemble_prob = min(ensemble_prob + 0.03, 0.95)
+                    # Bid-Wall Absorption → bearish breakdown
+                    if whale.get("whale_absorption_bid"):
+                        ensemble_prob = max(ensemble_prob - 0.03, 0.05)
+
+                    # Nahe Wall als Widerstand: hemmt Trades in diese Richtung
+                    if whale.get("whale_wall_ask") and whale.get("whale_wall_ask_distance", 1) < 0.005:
+                        confidence *= 0.8  # Resistance nahe → weniger Confidence
+                    if whale.get("whale_wall_bid") and whale.get("whale_wall_bid_distance", 1) < 0.005:
+                        confidence *= 1.1  # Support nahe → mehr Confidence
+
+                confidence = min(confidence, 1.0)
+
                 # Regime-Info
                 adx_val = latest_row.get("1h_adx", 0) if latest_row is not None else 0
                 chop_val = latest_row.get("1h_chop", 0) if latest_row is not None else 0
@@ -777,6 +833,7 @@ def main():
                 print(f"  │ {C.BOLD}XRP/USDT{C.RESET}  ${current_price:.4f}  │  "
                       f"Ensemble: {ensemble_prob:.0%}  │  Conf: {confidence:.0%}  │  "
                       f"Regime: {regime_label} (ADX:{adx_val:.0f})", flush=True)
+                print(f"  │ {C.PURPLE}{whale_txt}{C.RESET}", flush=True)
                 for name, pool in pools.items():
                     cfg = POOLS[name]
                     wr = f"{pool.win_rate:.0%}" if pool.n_trades > 0 else "–"
@@ -796,7 +853,25 @@ def main():
 
                     # RL Agent entscheidet selbst (regime-aware)
                     if cfg["type"] == "rl" and isinstance(pool, RLPool):
-                        rl_action = pool.get_rl_action(X, current_price, latest_row=latest_row)
+                        rl_action, rl_confidence = pool.get_rl_action(X, current_price, latest_row=latest_row)
+
+                        # Gate 1: Regime – kein neuer Trade im Seitwärtsmarkt
+                        adx_live = float(latest_row.get("1h_adx", 0)) if latest_row is not None else 0
+                        chop_live = float(latest_row.get("1h_chop", 0)) if latest_row is not None else 0
+                        if pd.isna(adx_live): adx_live = 0
+                        if pd.isna(chop_live): chop_live = 0
+                        is_sideways = adx_live < 20 and chop_live > 0.6
+
+                        if is_sideways and len(pool.open_positions) == 0 and abs(rl_action) > 0.10:
+                            log(f"{cfg['emoji']} {cfg['label']} REGIME GATE: Sideways (ADX:{adx_live:.0f} Chop:{chop_live:.2f}) – blocked", C.YELLOW)
+                            rl_action = 0.0
+
+                        # Gate 2: Confidence – nur traden wenn PPO sicher ist
+                        MIN_RL_CONFIDENCE = 0.7
+                        if rl_confidence < MIN_RL_CONFIDENCE and len(pool.open_positions) == 0 and abs(rl_action) > 0.10:
+                            log(f"{cfg['emoji']} {cfg['label']} LOW CONFIDENCE: {rl_confidence:.2f} < {MIN_RL_CONFIDENCE} – blocked", C.YELLOW)
+                            rl_action = 0.0
+
                         actions = pool.process_rl_signal(rl_action, current_price, atr_rel)
                         for act in actions:
                             if act[0] == "OPEN":
@@ -804,15 +879,16 @@ def main():
                                 traded_pools.append(name)
                                 dir_emoji = "\u2934\uFE0F" if pos["direction"] == "long" else "\u2935\uFE0F"  # ⤴️ Long / ⤵️ Short
                                 log(f"{cfg['emoji']} {cfg['label']} OPEN {pos['direction'].upper()}  "
-                                    f"${current_price:.4f}  Size: ${pos['size']:.2f}  RL-Action: {rl_action:+.2f}", C.PURPLE)
+                                    f"${current_price:.4f}  Size: ${pos['size']:.2f}  RL: {rl_action:+.2f} Conf: {rl_confidence:.2f}", C.PURPLE)
                                 tg_send(
                                     f"{dir_emoji} <b>TRADE OPEN</b> – {cfg['emoji']} {cfg['label']}\n\n"
                                     f"Richtung: <b>{pos['direction'].upper()}</b>\n"
                                     f"Preis: <code>${current_price:.4f}</code>\n"
                                     f"Einsatz: <code>${pos['size']:.2f}</code>\n"
-                                    f"RL-Action: <code>{rl_action:+.2f}</code>\n"
+                                    f"RL-Action: <code>{rl_action:+.2f}</code> Conf: <code>{rl_confidence:.2f}</code>\n"
                                     f"Stop-Loss: <code>${pos['stop_loss']:.4f}</code>\n"
-                                    f"Haltezeit: {HOLD_CANDLES}h"
+                                    f"Haltezeit: {HOLD_CANDLES}h\n"
+                                    f"🐋 {whale_txt}"
                                 )
                             elif act[0] == "CLOSE":
                                 _, pos, pnl, reason = act
@@ -850,11 +926,12 @@ def main():
                                 f"Einsatz: <code>${pos['size']:.2f}</code>\n"
                                 f"Confidence: <code>{confidence:.0%}</code>\n"
                                 f"Stop-Loss: <code>${pos['stop_loss']:.4f}</code>\n"
-                                f"Haltezeit: {HOLD_CANDLES}h"
+                                f"Haltezeit: {HOLD_CANDLES}h\n"
+                                f"🐋 {whale_txt}"
                             )
 
                 if not traded_pools:
-                    log(f"Kein Trade (Conf: {confidence:.0%}, RL: {pools['rl_agent'].position_state:+.2f})", C.DIM)
+                    log(f"Kein Trade (ML-Conf: {confidence:.0%}, RL-Pos: {pools['rl_agent'].position_state:+.2f})", C.DIM)
 
                 # Equity-Snapshot (alle Pools)
                 eq_row = {
@@ -877,6 +954,11 @@ def main():
                     "rf_prob": round(rf_prob, 4),
                     "xgb_prob": round(xgb_prob, 4),
                     "confidence": round(confidence, 4),
+                    "whale_imbalance": whale.get("whale_bid_ask_imbalance"),
+                    "whale_net_flow": whale.get("whale_net_flow"),
+                    "whale_big_trades": whale.get("whale_big_trade_count", 0),
+                    "whale_wall_bid": whale.get("whale_wall_bid", 0),
+                    "whale_wall_ask": whale.get("whale_wall_ask", 0),
                 }
                 for name in pools:
                     is_l, is_s = pools[name].check_signal(ensemble_prob)

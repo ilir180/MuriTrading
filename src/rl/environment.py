@@ -48,7 +48,8 @@ class XRPTradingEnv(gym.Env):
                    "1h_trend_consistency", "1h_regime_trend"]
 
     def __init__(self, df, feature_cols, initial_capital=1000.0,
-                 max_position_pct=0.20, fee_rate=0.0006):
+                 max_position_pct=0.20, fee_rate=0.0006,
+                 max_hold_steps=2):
         super().__init__()
 
         self.df = df.reset_index(drop=True)
@@ -56,6 +57,7 @@ class XRPTradingEnv(gym.Env):
         self.initial_capital = initial_capital
         self.max_position_pct = max_position_pct
         self.fee_rate = fee_rate
+        self.max_hold_steps = max_hold_steps
 
         self.n_features = len(feature_cols)
 
@@ -132,6 +134,7 @@ class XRPTradingEnv(gym.Env):
         self.wins = 0
         self.losses = 0
         self.steps_flat = 0  # Zähler für flat-Steps
+        self.steps_in_position = 0  # Zähler für Haltezeit
 
         # Tracking
         self.equity_curve = [self.capital]
@@ -188,6 +191,50 @@ class XRPTradingEnv(gym.Env):
 
         # Position-Änderung berechnen
         position_change = target_position - self.position
+
+        # FORCED TIME EXIT: Position zu lange gehalten → zwangsschliessen
+        if abs(self.position) > 0.05 and self.steps_in_position >= self.max_hold_steps:
+            pnl = self._unrealized_pnl()
+            fee = abs(self.position_size) * self.fee_rate
+            net_pnl = pnl - fee
+            self.capital += net_pnl
+            self.total_pnl += net_pnl
+            self.total_fees += fee
+
+            pnl_reward = net_pnl / self.initial_capital
+            reward += pnl_reward
+            # Fixe Strafe: Agent hat es nicht geschafft, rechtzeitig zu schliessen
+            reward -= 0.003
+            # Extra-Strafe bei Verlust
+            if net_pnl < 0:
+                reward -= 0.002
+
+            if net_pnl > 0:
+                self.wins += 1
+            elif net_pnl < 0:
+                self.losses += 1
+            self.n_trades += 1
+
+            self.trade_log.append({
+                "step": self.current_step, "price": current_price,
+                "direction": "long" if self.position > 0 else "short",
+                "pnl": net_pnl, "capital": self.capital,
+                "adx": adx, "is_trending": is_trending,
+                "exit_reason": "time_exit",
+            })
+
+            self.position = 0.0
+            self.position_size = 0.0
+            self.entry_price = 0.0
+            self.steps_in_position = 0
+            # Recalculate position_change from flat
+            position_change = target_position - 0.0
+
+        # Haltezeit tracken
+        if abs(self.position) > 0.05:
+            self.steps_in_position += 1
+        else:
+            self.steps_in_position = 0
 
         # Nur handeln wenn Änderung signifikant (> 10% Schritt)
         if abs(position_change) > 0.10:
@@ -246,11 +293,13 @@ class XRPTradingEnv(gym.Env):
                     reward -= 0.001 * abs(target_position)
 
                 self.steps_flat = 0
+                self.steps_in_position = 0
             else:
                 self.position = 0.0
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.steps_flat = 0
+                self.steps_in_position = 0
         else:
             # Agent hat sich entschieden NICHTS zu tun
             if abs(self.position) < 0.05:
