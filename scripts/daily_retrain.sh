@@ -118,23 +118,38 @@ fi
 echo ""
 echo "── STEP 6: Bot neustarten ─────────────────────────────"
 
-# Alten Bot stoppen (falls via launchd)
-if launchctl list | grep -q "com.muritrading.bot"; then
-    launchctl stop com.muritrading.bot 2>/dev/null || true
-    sleep 3
-    launchctl start com.muritrading.bot 2>/dev/null || true
-    echo "✓ Bot via launchd neugestartet"
-else
-    # Falls Bot als Prozess läuft
-    BOT_PID=$(pgrep -f "paper_trader.py" 2>/dev/null || true)
-    if [ -n "$BOT_PID" ]; then
-        kill -TERM "$BOT_PID" 2>/dev/null || true
-        sleep 3
-        echo "  Alter Bot gestoppt (PID: $BOT_PID)"
+# Bot stoppen und warten bis er wirklich tot ist
+BOT_PID=$(pgrep -f "paper_trader.py" 2>/dev/null || true)
+if [ -n "$BOT_PID" ]; then
+    kill -TERM "$BOT_PID" 2>/dev/null || true
+    # Warten bis Prozess wirklich beendet ist (max 15s)
+    for i in $(seq 1 15); do
+        if ! pgrep -f "paper_trader.py" > /dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    # Falls immer noch da, force kill
+    if pgrep -f "paper_trader.py" > /dev/null 2>&1; then
+        kill -9 $(pgrep -f "paper_trader.py") 2>/dev/null || true
+        sleep 2
     fi
-    # Bot im Hintergrund starten
-    nohup python src/bot/paper_trader.py >> "$LOG_DIR/bot.log" 2>&1 &
-    echo "✓ Bot gestartet (PID: $!)"
+    echo "  Alter Bot gestoppt (PID: $BOT_PID)"
+fi
+
+# Bot neu starten via launchd (unload/load garantiert sauberen Neustart)
+PLIST="$HOME/Library/LaunchAgents/com.muritrading.papertrader.plist"
+launchctl unload "$PLIST" 2>/dev/null || true
+sleep 2
+launchctl load "$PLIST" 2>/dev/null || true
+sleep 5
+
+NEW_PID=$(pgrep -f "paper_trader.py" 2>/dev/null || true)
+if [ -n "$NEW_PID" ]; then
+    echo "✓ Bot gestartet (PID: $NEW_PID)"
+else
+    echo "⚠ Bot konnte nicht gestartet werden!"
+    tg_send "⚠ <b>Bot konnte nach Retrain nicht gestartet werden!</b>"
 fi
 
 # ── Zusammenfassung ───────────────────────────────────────────

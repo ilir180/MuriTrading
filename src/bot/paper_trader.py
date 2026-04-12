@@ -33,6 +33,8 @@ PROJECT_ROOT = os.path.expanduser("~/MuriTrading")
 sys.path.insert(0, PROJECT_ROOT)
 from src.features.build_features import add_indicators
 from src.features.whale_features import compute_whale_features, whale_signal_text
+from src.features.cross_asset import build_cross_asset_features, cross_asset_signal_text
+from src.features.sentiment import compute_sentiment_features, sentiment_signal_text
 
 # ── Pfade ──────────────────────────────────────────────────────
 MODEL_DIR   = os.path.join(PROJECT_ROOT, "models")
@@ -819,6 +821,58 @@ def main():
 
                 confidence = min(confidence, 1.0)
 
+                # Cross-Asset Features (BTC/ETH als Frühwarnung)
+                cross = build_cross_asset_features(exchange)
+                cross_txt = cross_asset_signal_text(cross)
+                ca_ok = not math.isnan(cross.get("ca_btc_ret_1", float("nan")))
+
+                # Cross-Asset Adjustments
+                if ca_ok:
+                    catchup = cross.get("ca_catchup_signal", 0) or 0
+                    # Starke Divergenz: BTC bewegt sich, XRP noch nicht → Catch-Up
+                    if catchup > 2.0:  # z-score > 2 = starkes Signal
+                        ensemble_prob = min(ensemble_prob + 0.04, 0.95)
+                    elif catchup < -2.0:
+                        ensemble_prob = max(ensemble_prob - 0.04, 0.05)
+
+                    # BTC-Only Pump = bearish für Alts
+                    if cross.get("ca_btc_only_pump"):
+                        confidence *= 0.7
+
+                    # Alt-Pump ohne BTC = bullish für XRP
+                    if cross.get("ca_alt_only_pump"):
+                        ensemble_prob = min(ensemble_prob + 0.03, 0.95)
+
+                    # Alt-Season Boost
+                    if cross.get("ca_alt_season", 0) >= 2:
+                        confidence *= 1.15
+
+                    # Correlation Breakdown = Vorsicht
+                    if cross.get("ca_corr_breakdown"):
+                        confidence *= 0.8
+
+                confidence = min(confidence, 1.0)
+
+                # Sentiment Features
+                sentiment = compute_sentiment_features()
+                sentiment_txt = sentiment_signal_text(sentiment)
+                sent_ok = not math.isnan(sentiment.get("sent_fear_greed", float("nan")))
+
+                # Sentiment Adjustments (contrarian)
+                if sent_ok:
+                    fng = sentiment["sent_fear_greed"]
+                    extreme = sentiment.get("sent_fear_greed_extreme", 0)
+                    composite = sentiment.get("sent_composite", 0.5) or 0.5
+
+                    # Extreme Fear = contrarian bullish (Markt überverkauft)
+                    if extreme == -1:  # Fear & Greed ≤ 20
+                        ensemble_prob = min(ensemble_prob + 0.03, 0.95)
+                    # Extreme Greed = contrarian bearish
+                    elif extreme == 1:  # Fear & Greed ≥ 80
+                        ensemble_prob = max(ensemble_prob - 0.03, 0.05)
+
+                confidence = min(confidence, 1.0)
+
                 # Regime-Info
                 adx_val = latest_row.get("1h_adx", 0) if latest_row is not None else 0
                 chop_val = latest_row.get("1h_chop", 0) if latest_row is not None else 0
@@ -834,6 +888,8 @@ def main():
                       f"Ensemble: {ensemble_prob:.0%}  │  Conf: {confidence:.0%}  │  "
                       f"Regime: {regime_label} (ADX:{adx_val:.0f})", flush=True)
                 print(f"  │ {C.PURPLE}{whale_txt}{C.RESET}", flush=True)
+                print(f"  │ {C.BLUE}{cross_txt}{C.RESET}", flush=True)
+                print(f"  │ {C.YELLOW}{sentiment_txt}{C.RESET}", flush=True)
                 for name, pool in pools.items():
                     cfg = POOLS[name]
                     wr = f"{pool.win_rate:.0%}" if pool.n_trades > 0 else "–"
@@ -959,6 +1015,12 @@ def main():
                     "whale_big_trades": whale.get("whale_big_trade_count", 0),
                     "whale_wall_bid": whale.get("whale_wall_bid", 0),
                     "whale_wall_ask": whale.get("whale_wall_ask", 0),
+                    "ca_btc_ret_1": cross.get("ca_btc_ret_1"),
+                    "ca_catchup_signal": cross.get("ca_catchup_signal"),
+                    "ca_corr_48": cross.get("ca_corr_48"),
+                    "ca_alt_season": cross.get("ca_alt_season"),
+                    "sent_fear_greed": sentiment.get("sent_fear_greed"),
+                    "sent_composite": sentiment.get("sent_composite"),
                 }
                 for name in pools:
                     is_l, is_s = pools[name].check_signal(ensemble_prob)
