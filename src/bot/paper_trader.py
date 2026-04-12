@@ -317,6 +317,27 @@ def build_features(exchange, feature_cols):
     if avail_bear: df_base["confluence_bear"] = df_base[avail_bear].sum(axis=1)
     df_base["confluence_net"] = df_base.get("confluence_bull", 0) - df_base.get("confluence_bear", 0)
 
+    # Cross-Asset Features (BTC/ETH) live berechnen falls Modell sie braucht
+    ca_cols_needed = [c for c in feature_cols if c.startswith("ca_")]
+    if ca_cols_needed:
+        try:
+            from src.features.cross_asset import build_cross_asset_features_batch, _fetch_candles
+            btc_15m = _fetch_candles(exchange, "BTC/USDT", "15m", 200)
+            eth_15m = _fetch_candles(exchange, "ETH/USDT", "15m", 200)
+            btc_1h  = _fetch_candles(exchange, "BTC/USDT", "1h",  200)
+            eth_1h  = _fetch_candles(exchange, "ETH/USDT", "1h",  200)
+            ca_df = build_cross_asset_features_batch(df_15m, btc_15m, eth_15m, btc_1h, eth_1h)
+            ca_sel = ca_df[[c for c in ca_df.columns if c in ca_cols_needed]].copy()
+            df_base = pd.merge_asof(
+                df_base.sort_index(), ca_sel.sort_index(),
+                left_index=True, right_index=True, direction="backward",
+            )
+            for col in ca_sel.columns:
+                df_base[col] = df_base[col].ffill()
+        except Exception as e:
+            for col in ca_cols_needed:
+                df_base[col] = 0.0
+
     latest = df_base[feature_cols].dropna()
     if latest.empty:
         return None, None, None

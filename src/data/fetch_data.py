@@ -11,7 +11,7 @@ import time
 import os
 
 # ── Konfiguration ────────────────────────────────────────────────
-SYMBOL     = "XRP/USDT"
+SYMBOLS    = ["XRP/USDT", "BTC/USDT", "ETH/USDT"]
 TIMEFRAMES = ["1d", "4h", "1h", "15m"]
 YEARS_BACK = 4
 OUTPUT_DIR = os.path.expanduser("~/MuriTrading/data/raw")
@@ -78,22 +78,26 @@ def main():
     since_ms  = int(since_dt.timestamp() * 1000)
 
     print(f"\nMuriTrading – Datenabruf")
-    print(f"Asset     : {SYMBOL}")
+    print(f"Assets    : {', '.join(SYMBOLS)}")
     print(f"Von       : {since_dt.strftime('%Y-%m-%d')} bis heute")
     print(f"Timeframes: {', '.join(TIMEFRAMES)}")
     print(f"Zielordner: {OUTPUT_DIR}\n")
 
-    for tf in TIMEFRAMES:
-        candles = fetch_ohlcv(exchange, SYMBOL, tf, since_ms)
-        df = candles_to_df(candles)
+    for symbol in SYMBOLS:
+        sym_label = symbol.replace("/", "_")
+        print(f"── {symbol} ──────────────────────────────")
 
-        filename = f"XRP_USDT_{tf}.csv"
-        filepath = os.path.join(OUTPUT_DIR, filename)
-        df.to_csv(filepath)
+        for tf in TIMEFRAMES:
+            candles = fetch_ohlcv(exchange, symbol, tf, since_ms)
+            df = candles_to_df(candles)
 
-        print(f"  Gespeichert: {filename}")
-        print(f"  Zeitraum  : {df.index[0].date()} → {df.index[-1].date()}")
-        print(f"  Zeilen    : {len(df):,}\n")
+            filename = f"{sym_label}_{tf}.csv"
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            df.to_csv(filepath)
+
+            print(f"  {filename}: {len(df):,} Kerzen  ({df.index[0].date()} → {df.index[-1].date()})")
+
+        print()
 
     print("Datenabruf abgeschlossen.")
     print(f"Alle Dateien in: {OUTPUT_DIR}")

@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-04-10T04:04:59.006425",
+  "trained_at": "2026-04-12T21:22:20.907349",
   "feature_cols": [
     "4h_candle_bull",
     "4h_return_1",
@@ -20,8 +20,8 @@
     "1d_return_3",
     "4h_return_6",
     "1d_obv_norm",
-    "1h_ema_9_dist",
     "1d_rsi_14",
+    "1h_ema_9_dist",
     "4h_ema_50_dist",
     "1d_ema_21_dist",
     "1h_bb_pos",
@@ -49,13 +49,14 @@
     "15m_ema_9_above_21",
     "4h_rsi_oversold",
     "1h_ema_50_dist",
+    "ca_div_z_16",
     "1h_return_12",
     "4h_plus_di",
-    "15m_obv_norm",
-    "15m_return_12"
+    "15m_return_12",
+    "15m_obv_norm"
   ],
-  "n_train": 26708,
-  "n_test": 6677,
-  "train_end": "2025-07-05",
-  "test_start": "2025-07-05"
+  "n_train": 26721,
+  "n_test": 6681,
+  "train_end": "2025-07-08",
+  "test_start": "2025-07-08"
 }

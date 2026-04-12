@@ -25,8 +25,8 @@ LABEL_MAX = 0.90
 
 # ── 1. Laden ────────────────────────────────────────────────────
 
-def load_csv(timeframe):
-    path = os.path.join(DATA_DIR, f"XRP_USDT_{timeframe}.csv")
+def load_csv(timeframe, symbol="XRP_USDT"):
+    path = os.path.join(DATA_DIR, f"{symbol}_{timeframe}.csv")
     df = pd.read_csv(path, index_col="datetime", parse_dates=True)
     df.index = df.index.tz_localize("UTC")
     return df
@@ -339,6 +339,37 @@ def main():
         print(f"   +{len(ext_cols)} externe Features hinzugefügt")
     except Exception as e:
         print(f"   Externe Daten übersprungen: {e}")
+
+    # Cross-Asset Features (BTC/ETH als Frühwarnung)
+    print("\n3c. Cross-Asset Features (BTC/ETH)...")
+    try:
+        from src.features.cross_asset import build_cross_asset_features_batch
+        btc_15m = load_csv("15m", "BTC_USDT")
+        eth_15m = load_csv("15m", "ETH_USDT")
+        btc_1h  = load_csv("1h",  "BTC_USDT")
+        eth_1h  = load_csv("1h",  "ETH_USDT")
+        print(f"   BTC 15m: {len(btc_15m):,} | ETH 15m: {len(eth_15m):,}")
+
+        ca_df = build_cross_asset_features_batch(df_15m, btc_15m, eth_15m, btc_1h, eth_1h)
+        ca_cols = [c for c in ca_df.columns if c.startswith("ca_")]
+        ca_sel = ca_df[ca_cols].copy()
+
+        # merge_asof: 15m Cross-Asset → 1h Base
+        df_base = pd.merge_asof(
+            df_base.sort_index(),
+            ca_sel.sort_index(),
+            left_index=True,
+            right_index=True,
+            direction="backward",
+        )
+        for col in ca_cols:
+            df_base[col] = df_base[col].ffill()
+
+        print(f"   +{len(ca_cols)} Cross-Asset Features hinzugefügt")
+    except FileNotFoundError:
+        print("   BTC/ETH Daten nicht vorhanden – zuerst fetch_data.py ausführen")
+    except Exception as e:
+        print(f"   Cross-Asset Features übersprungen: {e}")
 
     print(f"   Feature Matrix: {df_base.shape[1]} Spalten")
 

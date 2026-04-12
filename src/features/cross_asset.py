@@ -194,6 +194,41 @@ CROSS_ASSET_FEATURES = [
 ]
 
 
+def build_cross_asset_features_batch(xrp_15m, btc_15m, eth_15m, btc_1h, eth_1h):
+    """
+    Batch-Version für historisches Training.
+    Gibt kompletten DataFrame mit allen Cross-Asset Features zurück.
+
+    Args:
+        xrp_15m, btc_15m, eth_15m: 15m DataFrames (OHLCV)
+        btc_1h, eth_1h: 1h DataFrames (OHLCV)
+
+    Returns:
+        DataFrame mit ca_* Spalten, indiziert auf 15m-Zeitstempel.
+    """
+    f1 = _btc_lead_features(xrp_15m, btc_15m)
+    f2 = _ethbtc_ratio_features(eth_1h, btc_1h)
+    f3 = _btc_dominance_features(xrp_15m, eth_15m, btc_15m)
+    f4 = _divergence_features(xrp_15m, btc_15m)
+    f5 = _correlation_features(xrp_15m, btc_15m)
+
+    result = f1.copy()
+    for fx in [f3, f4, f5]:
+        result = result.join(fx, how="left")
+
+    result = pd.merge_asof(
+        result.sort_index(), f2.sort_index(),
+        left_index=True, right_index=True, direction="backward",
+    )
+
+    # Forward-fill 1h Features
+    for col in f2.columns:
+        if col in result.columns:
+            result[col] = result[col].ffill()
+
+    return result
+
+
 def build_cross_asset_features(exchange, xrp_15m=None):
     """
     Hauptfunktion: Holt BTC/ETH Daten und berechnet alle Cross-Asset Features.
