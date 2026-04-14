@@ -51,6 +51,16 @@ SLIPPAGE         = 0.0002
 ROUND_TRIP       = (TAKER_FEE + SLIPPAGE) * 2
 STOP_LOSS_MULT   = 1.5
 HOLD_CANDLES     = 2
+
+# ── Hebel (simuliert, Confidence-gestaffelt) ─────────────────
+# Regime-Trend → voller Hebel erlaubt, Seitwärts → max 2x
+LEVERAGE_TIERS = [
+    (0.80, 8),   # Conf ≥ 80% → 8x
+    (0.70, 5),   # Conf ≥ 70% → 5x
+    (0.60, 3),   # Conf ≥ 60% → 3x
+    (0.00, 1),   # Darunter   → 1x (kein Hebel)
+]
+LEVERAGE_SIDEWAYS_CAP = 2  # Max Hebel im Seitwärtsmarkt
 CHECK_INTERVAL   = 60
 DAILY_REPORT_HOUR= 22          # UTC - täglicher Report
 RETRAIN_WINDOW   = 50          # Letzte N Signale für Performance-Check
@@ -351,6 +361,36 @@ def predict(rf, xgb, X):
     return float(ensemble[0]), float(rf_prob[0]), float(xgb_prob[0])
 
 
+def calc_leverage(confidence, is_trending, whale_confirmed=False):
+    """
+    Bestimmt den Hebel basierend auf Confidence, Regime und Whale-Bestätigung.
+
+    Args:
+        confidence: 0-1, ML Confidence
+        is_trending: bool, ob der Markt im Trend ist
+        whale_confirmed: bool, ob Whale-Flow die Richtung bestätigt
+
+    Returns:
+        int: Hebel (1-8x)
+    """
+    # Basis-Hebel nach Confidence
+    leverage = 1
+    for min_conf, lev in LEVERAGE_TIERS:
+        if confidence >= min_conf:
+            leverage = lev
+            break
+
+    # Seitwärtsmarkt → Hebel deckeln
+    if not is_trending:
+        leverage = min(leverage, LEVERAGE_SIDEWAYS_CAP)
+
+    # Whale-Bestätigung → +1x Bonus (max 10x)
+    if whale_confirmed and leverage >= 3:
+        leverage = min(leverage + 1, 10)
+
+    return leverage
+
+
 # ═══════════════════════════════════════════════════════════════
 #  POOL (ein Topf mit eigenem Kapital und Trades)
 # ═══════════════════════════════════════════════════════════════
@@ -407,7 +447,7 @@ class Pool:
         is_short = ensemble_prob <= (1 - conf_prob)
         return is_long, is_short
 
-    def open_trade(self, direction, price, confidence, atr_rel):
+    def open_trade(self, direction, price, confidence, atr_rel, leverage=1):
         today = datetime.now(timezone.utc).date().isoformat()
         self.daily_trades[today] = self.daily_trades.get(today, 0)
         if self.daily_trades[today] >= MAX_TRADES_PER_DAY:
@@ -417,13 +457,19 @@ class Pool:
         size = (self.capital * RISK_PER_TRADE) / stop_loss_pct
         size = min(size, self.capital * 0.20)
 
-        sl = price * (1 - stop_loss_pct) if direction == "long" else price * (1 + stop_loss_pct)
+        # Hebel anwenden
+        size *= leverage
+
+        # Stop-Loss enger bei Hebel (SL-Distanz / Hebel damit Verlust gleich bleibt)
+        effective_sl_pct = stop_loss_pct / leverage if leverage > 1 else stop_loss_pct
+        sl = price * (1 - effective_sl_pct) if direction == "long" else price * (1 + effective_sl_pct)
 
         pos = {
             "direction": direction, "entry_price": price,
             "size": round(size, 2), "entry_time": datetime.now(timezone.utc).isoformat(),
             "candles_held": 0, "stop_loss": round(sl, 6),
             "confidence": round(confidence, 4), "pool": self.name,
+            "leverage": leverage,
         }
         self.open_positions.append(pos)
         self.daily_trades[today] += 1
@@ -603,13 +649,25 @@ class RLPool(Pool):
             rl_max_daily = 3  # RL Agent: max 3 Trades/Tag (konservativer)
             if self.daily_trades[today] < rl_max_daily:
                 stop_loss_pct = max(atr_rel * STOP_LOSS_MULT, 0.001)
-                sl = current_price * (1 - stop_loss_pct) if direction == "long" else current_price * (1 + stop_loss_pct)
+
+                # Hebel basierend auf Action-Stärke (|target_position| als Proxy für Confidence)
+                rl_conf = abs(target_position)
+                leverage = 1
+                for min_conf, lev in LEVERAGE_TIERS:
+                    if rl_conf >= min_conf:
+                        leverage = lev
+                        break
+
+                size *= leverage
+                effective_sl_pct = stop_loss_pct / leverage if leverage > 1 else stop_loss_pct
+                sl = current_price * (1 - effective_sl_pct) if direction == "long" else current_price * (1 + effective_sl_pct)
 
                 pos = {
                     "direction": direction, "entry_price": current_price,
                     "size": round(size, 2), "entry_time": datetime.now(timezone.utc).isoformat(),
                     "candles_held": 0, "stop_loss": round(sl, 6),
                     "confidence": round(abs(target_position), 4), "pool": self.name,
+                    "leverage": leverage,
                 }
                 self.open_positions.append(pos)
                 self.daily_trades[today] += 1
@@ -955,13 +1013,16 @@ def main():
                                 pos = act[1]
                                 traded_pools.append(name)
                                 dir_emoji = "\u2934\uFE0F" if pos["direction"] == "long" else "\u2935\uFE0F"  # ⤴️ Long / ⤵️ Short
+                                rl_lev = pos.get("leverage", 1)
+                                rl_lev_txt = f"  {rl_lev}x" if rl_lev > 1 else ""
                                 log(f"{cfg['emoji']} {cfg['label']} OPEN {pos['direction'].upper()}  "
-                                    f"${current_price:.4f}  Size: ${pos['size']:.2f}  RL: {rl_action:+.2f} Conf: {rl_confidence:.2f}", C.PURPLE)
+                                    f"${current_price:.4f}  Size: ${pos['size']:.2f}{rl_lev_txt}  RL: {rl_action:+.2f} Conf: {rl_confidence:.2f}", C.PURPLE)
                                 tg_send(
                                     f"{dir_emoji} <b>TRADE OPEN</b> – {cfg['emoji']} {cfg['label']}\n\n"
                                     f"Richtung: <b>{pos['direction'].upper()}</b>\n"
                                     f"Preis: <code>${current_price:.4f}</code>\n"
-                                    f"Einsatz: <code>${pos['size']:.2f}</code>\n"
+                                    f"Einsatz: <code>${pos['size']:.2f}</code>"
+                                    f"{f' (<b>{rl_lev}x</b> Hebel)' if rl_lev > 1 else ''}\n"
                                     f"RL-Action: <code>{rl_action:+.2f}</code> Conf: <code>{rl_confidence:.2f}</code>\n"
                                     f"Stop-Loss: <code>${pos['stop_loss']:.4f}</code>\n"
                                     f"Haltezeit: {HOLD_CANDLES}h\n"
@@ -989,18 +1050,27 @@ def main():
 
                     if (is_long or is_short) and len(pool.open_positions) == 0:
                         direction = "long" if is_long else "short"
-                        pos = pool.open_trade(direction, current_price, confidence, atr_rel)
+
+                        # Hebel berechnen
+                        is_trend = bool(regime_val)
+                        whale_dir_ok = (direction == "long" and whale.get("whale_bid_ask_imbalance", 0.5) > 0.6) or \
+                                       (direction == "short" and whale.get("whale_bid_ask_imbalance", 0.5) < 0.4)
+                        lev = calc_leverage(confidence, is_trend, whale_confirmed=whale_dir_ok)
+
+                        pos = pool.open_trade(direction, current_price, confidence, atr_rel, leverage=lev)
                         if pos:
                             traded_pools.append(name)
                             dir_emoji = "\u2934\uFE0F" if direction == "long" else "\u2935\uFE0F"  # ⤴️ Long / ⤵️ Short
+                            lev_txt = f"  {lev}x" if lev > 1 else ""
                             log(f"{cfg['emoji']} {cfg['label']} OPEN {direction.upper()}  "
-                                f"${current_price:.4f}  Size: ${pos['size']:.2f}  Conf: {confidence:.0%}", C.GREEN)
+                                f"${current_price:.4f}  Size: ${pos['size']:.2f}{lev_txt}  Conf: {confidence:.0%}", C.GREEN)
 
                             tg_send(
                                 f"{dir_emoji} <b>TRADE OPEN</b> – {cfg['emoji']} {cfg['label']}\n\n"
                                 f"Richtung: <b>{direction.upper()}</b>\n"
                                 f"Preis: <code>${current_price:.4f}</code>\n"
-                                f"Einsatz: <code>${pos['size']:.2f}</code>\n"
+                                f"Einsatz: <code>${pos['size']:.2f}</code>"
+                                f"{f' (<b>{lev}x</b> Hebel)' if lev > 1 else ''}\n"
                                 f"Confidence: <code>{confidence:.0%}</code>\n"
                                 f"Stop-Loss: <code>${pos['stop_loss']:.4f}</code>\n"
                                 f"Haltezeit: {HOLD_CANDLES}h\n"
