@@ -49,7 +49,7 @@ class XRPTradingEnv(gym.Env):
 
     def __init__(self, df, feature_cols, initial_capital=1000.0,
                  max_position_pct=0.20, fee_rate=0.0006,
-                 max_hold_steps=2):
+                 max_hold_steps=4):
         super().__init__()
 
         self.df = df.reset_index(drop=True)

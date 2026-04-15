@@ -50,7 +50,9 @@ TAKER_FEE        = 0.0004
 SLIPPAGE         = 0.0002
 ROUND_TRIP       = (TAKER_FEE + SLIPPAGE) * 2
 STOP_LOSS_MULT   = 1.5
-HOLD_CANDLES     = 2
+HOLD_CANDLES     = 4            # 4h Haltezeit (war 2h)
+TRAILING_ACTIVATE = 0.003       # Trailing Stop aktiviert ab +0.3% Gewinn
+TRAILING_DISTANCE = 0.002       # Trailing Stop folgt 0.2% unter Höchststand
 
 # ── Hebel (simuliert, Confidence-gestaffelt) ─────────────────
 # Regime-Trend → voller Hebel erlaubt, Seitwärts → max 2x
@@ -476,7 +478,7 @@ class Pool:
         return pos
 
     def check_exits(self, current_price):
-        """Prüft Stop-Loss, Take-Profit und Haltezeit."""
+        """Prüft Stop-Loss, Trailing Stop, Take-Profit und Haltezeit."""
         closed = []
         for pos in self.open_positions:
             pos["candles_held"] = pos.get("candles_held", 0) + 1
@@ -493,12 +495,34 @@ class Pool:
                 tp = pos["entry_price"] - sl_dist * 2.0
                 hit_tp = current_price <= tp
 
+            # Trailing Stop: sichert laufende Gewinne ab
+            hit_trailing = False
+            if pos["direction"] == "long":
+                # Höchststand tracken
+                pos["peak_price"] = max(pos.get("peak_price", pos["entry_price"]), current_price)
+                unrealized_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
+                # Aktivieren ab TRAILING_ACTIVATE Gewinn
+                if unrealized_pct >= TRAILING_ACTIVATE:
+                    trailing_sl = pos["peak_price"] * (1 - TRAILING_DISTANCE)
+                    if current_price <= trailing_sl:
+                        hit_trailing = True
+            else:  # short
+                pos["trough_price"] = min(pos.get("trough_price", pos["entry_price"]), current_price)
+                unrealized_pct = (pos["entry_price"] - current_price) / pos["entry_price"]
+                if unrealized_pct >= TRAILING_ACTIVATE:
+                    trailing_sl = pos["trough_price"] * (1 + TRAILING_DISTANCE)
+                    if current_price >= trailing_sl:
+                        hit_trailing = True
+
             if hit_sl:
                 pnl = self._close(pos, current_price, "stop_loss")
                 closed.append((pos, pnl, "STOP-LOSS"))
             elif hit_tp:
                 pnl = self._close(pos, current_price, "take_profit")
                 closed.append((pos, pnl, "TAKE-PROFIT \U0001F3AF"))
+            elif hit_trailing:
+                pnl = self._close(pos, current_price, "trailing_stop")
+                closed.append((pos, pnl, "TRAILING-STOP \U0001F4C8"))
             elif pos["candles_held"] >= HOLD_CANDLES:
                 pnl = self._close(pos, current_price, "time_exit")
                 closed.append((pos, pnl, "TIME-EXIT"))
