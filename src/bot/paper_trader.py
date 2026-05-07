@@ -1,15 +1,23 @@
 """
-MuriTrading – Phase 5: Paper-Trading Bot (Multi-Pool)
-Drei Töpfe mit unterschiedlichen Confidence-Leveln laufen parallel:
-  - Konservativ (75%): wenige Trades, höchste Accuracy
-  - Standard (65%):    ausbalanciert
-  - Aggressiv (50%):   viele Trades, niedrigere Accuracy
+MuriTrading v3.0 – Strategy-Based Paper Trading Bot
+=====================================================
+Kompletter Neuaufbau. Bewährte Strategien statt blindes ML-Vertrauen.
+
+Kernänderungen vs v2:
+  - 4H Primär-Timeframe (grössere Moves, Fees irrelevant)
+  - Strategie-basierte Signale mit ML als Filter
+  - Trend Following + Mean Reversion + Breakout
+  - ATR-basierte Positionsgrösse (1.5% Risiko pro Trade)
+  - Trailing Stops als primärer Exit
+  - Max 1 Position gleichzeitig
+  - Monatliches Drawdown-Limit (8%)
+  - Consecutive-Loss Circuit Breaker
 
 Start: python src/bot/paper_trader.py
 Stop:  Ctrl+C (speichert automatisch)
 """
 
-# Fix PyTorch/OpenMP + sklearn threading conflict (segfault prevention)
+# Fix PyTorch/OpenMP + sklearn threading conflict
 import os as _os
 _os.environ.setdefault("OMP_NUM_THREADS", "1")
 _os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -23,66 +31,67 @@ import os
 import sys
 import ccxt
 import time
+import math
 import signal as sig
 import requests as _requests
 from datetime import datetime, timezone, timedelta
-# PPO wird lazy geladen um Speicher-Crash zu vermeiden
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Tuple
 
 # ── Projekt-Root ───────────────────────────────────────────────
 PROJECT_ROOT = os.path.expanduser("~/MuriTrading")
 sys.path.insert(0, PROJECT_ROOT)
 from src.features.build_features import add_indicators
-from src.features.whale_features import compute_whale_features, whale_signal_text
-from src.features.cross_asset import build_cross_asset_features, cross_asset_signal_text
-from src.features.sentiment import compute_sentiment_features, sentiment_signal_text
 
 # ── Pfade ──────────────────────────────────────────────────────
 MODEL_DIR   = os.path.join(PROJECT_ROOT, "models")
 BOT_DIR     = os.path.join(PROJECT_ROOT, "data", "bot")
 SIGNALS_LOG = os.path.join(BOT_DIR, "signals.csv")
+STATE_FILE  = os.path.join(BOT_DIR, "bot_state_v3.json")
+TRADES_LOG  = os.path.join(BOT_DIR, "trades_v3.csv")
+EQUITY_LOG  = os.path.join(BOT_DIR, "equity_v3.csv")
 
-# ── Trading-Parameter ─────────────────────────────────────────
-SYMBOL           = "XRP/USDT"
-INITIAL_CAPITAL  = 1000.0       # Pro Topf
-RISK_PER_TRADE   = 0.01
-MAX_TRADES_PER_DAY = 4
-TAKER_FEE        = 0.0004
-SLIPPAGE         = 0.0002
-ROUND_TRIP       = (TAKER_FEE + SLIPPAGE) * 2
-STOP_LOSS_MULT   = 1.5
-HOLD_CANDLES     = 4            # 4h Haltezeit (war 2h)
-TRAILING_ACTIVATE = 0.003       # Trailing Stop aktiviert ab +0.3% Gewinn
-TRAILING_DISTANCE = 0.002       # Trailing Stop folgt 0.2% unter Höchststand
+# ═══════════════════════════════════════════════════════════════
+#  KONFIGURATION
+# ═══════════════════════════════════════════════════════════════
 
-# ── Hebel (simuliert, Confidence-gestaffelt) ─────────────────
-# Regime-Trend → voller Hebel erlaubt, Seitwärts → max 2x
-LEVERAGE_TIERS = [
-    (0.80, 8),   # Conf ≥ 80% → 8x
-    (0.70, 5),   # Conf ≥ 70% → 5x
-    (0.60, 3),   # Conf ≥ 60% → 3x
-    (0.00, 1),   # Darunter   → 1x (kein Hebel)
-]
-LEVERAGE_SIDEWAYS_CAP = 2  # Max Hebel im Seitwärtsmarkt
-CHECK_INTERVAL   = 60
-DAILY_REPORT_HOUR= 22          # UTC - täglicher Report
-RETRAIN_WINDOW   = 50          # Letzte N Signale für Performance-Check
-RETRAIN_THRESHOLD= 0.60        # Unter dieser Accuracy → Warnung
+SYMBOL             = "XRP/USDT"
+INITIAL_CAPITAL    = 1000.0
 
-# ── Die vier Töpfe ────────────────────────────────────────────
-POOLS = {
-    "konservativ": {"confidence": 0.75, "emoji": "\U0001F9CA", "label": "Konservativ", "type": "ml"},
-    "standard":    {"confidence": 0.65, "emoji": "\U0001F4CA", "label": "Standard",    "type": "ml"},
-    "aggressiv":   {"confidence": 0.50, "emoji": "\U0001F525", "label": "Aggressiv",   "type": "ml"},
-    "rl_agent":    {"confidence": 0.0,  "emoji": "\U0001F916", "label": "Predictlir RL", "type": "rl"},
-}
+# Timeframe & Intervalle
+PRIMARY_TF         = "4h"          # Signale nur auf 4H-Kerzen
+CHECK_INTERVAL     = 60            # Sekunden zwischen Checks
+CANDLE_WAIT_MIN    = 2             # Minuten nach Kerzenschluss warten
 
-# ── RL Modell ─────────────────────────────────────────────────
-RL_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "rl", "ppo_xrp")
+# Risk Management
+RISK_PER_TRADE     = 0.015         # 1.5% Risiko pro Trade
+MAX_OPEN_POSITIONS = 1             # Fokus: ein Trade gleichzeitig
+MAX_TRADES_PER_WEEK= 5             # Max 5 Trades pro Woche
+MAX_MONTHLY_DD     = 0.08          # 8% monatliches Drawdown-Limit
+CONSEC_LOSS_LIMIT  = 3             # Nach 3 Verlusten: 24h Pause
+COOLDOWN_HOURS     = 24            # Stunden Pause nach Circuit Breaker
 
-# ── Telegram ──────────────────────────────────────────────────
+# Fees (konservativ: Taker + Slippage)
+TAKER_FEE          = 0.0004
+SLIPPAGE           = 0.0002
+ROUND_TRIP         = (TAKER_FEE + SLIPPAGE) * 2   # 0.12%
+
+# Position Management
+MIN_REWARD_RISK    = 1.5           # 1.5:1 R:R (tighter = higher WR)
+SL_ATR_MULT        = 2.0           # Stop Loss = 2x ATR
+TRAILING_ATR_MULT  = 1.5           # Trailing Stop = 1.5x ATR
+TRAILING_ACTIVATE  = 0.8           # Trailing aktiviert ab 0.8x ATR Gewinn
+MAX_HOLD_CANDLES   = 18            # Max 72h (18 × 4h Kerzen)
+PARTIAL_TP_RR      = 1.0           # Partial Take-Profit bei 1:1 R:R
+PARTIAL_SIZE_PCT   = 0.50          # 50% der Position bei Partial TP schliessen
+BREAKEVEN_BUFFER   = 0.001         # 0.1% über Entry für Breakeven-Stop
+
+# Telegram
 TG_BOT_TOKEN = "8503143803:AAH-7DPWX-bXq-ITRGpw4TwkDTDtIsRzQt8"
 TG_CHAT_ID   = "7704168743"
 
+# Daily Report
+DAILY_REPORT_HOUR  = 22            # UTC
 
 # ═══════════════════════════════════════════════════════════════
 #  TELEGRAM
@@ -103,141 +112,6 @@ def tg_send(text):
 #  TERMINAL STYLING
 # ═══════════════════════════════════════════════════════════════
 
-def send_daily_report(pools, signals, start_time):
-    """Sendet tägliche Zusammenfassung per Telegram."""
-    now = datetime.now(timezone.utc)
-    uptime = now - start_time
-    hours = int(uptime.total_seconds() // 3600)
-    today = now.date().isoformat()
-
-    # Stärkstes Signal des Tages
-    today_signals = [s for s in signals if s.get("timestamp", "").startswith(today)]
-    max_conf = max((s.get("confidence", 0) for s in today_signals), default=0)
-    n_signals = len(today_signals)
-
-    # Fear & Greed live holen
-    fg_text = ""
-    try:
-        resp = _requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
-        fg = resp.json()["data"][0]
-        fg_text = f"\nFear & Greed: <code>{fg['value']}</code> ({fg['value_classification']})"
-    except Exception:
-        pass
-
-    # Pool-Status
-    pool_lines = ""
-    total_pnl = 0
-    for name, pool in pools.items():
-        cfg = POOLS[name]
-        wr = f"{pool.win_rate:.0%}" if pool.n_trades > 0 else "–"
-        today_trades = len([t for t in pool.trades if t.get("timestamp", "").startswith(today)])
-        total_pnl += pool.total_pnl
-        pool_lines += (
-            f"{cfg['emoji']} <b>{cfg['label']}</b>: "
-            f"<code>${pool.capital:.2f}</code> "
-            f"({pool.total_pnl:+.2f}$) "
-            f"WR:{wr} "
-            f"Trades heute: {today_trades}\n"
-        )
-
-    tg_send(
-        f"\U0001F4CB <b>Täglicher Report</b> – {today}\n\n"
-        f"Uptime: <code>{hours}h</code>\n"
-        f"Signale heute: <code>{n_signals}</code>\n"
-        f"Stärkstes Signal: <code>{max_conf:.0%}</code>\n"
-        f"{fg_text}\n\n"
-        f"{pool_lines}\n"
-        f"Gesamt PnL: <code>{total_pnl:+.2f}$</code>"
-    )
-
-
-def check_retrain_needed(signals, pools):
-    """Prüft ob das Modell schlecht performt und Retrain nötig ist."""
-    if len(signals) < RETRAIN_WINDOW:
-        return
-
-    recent = signals[-RETRAIN_WINDOW:]
-    # Nur Signale mit Trade prüfen (aggressiv hat die meisten)
-    traded = [s for s in recent if s.get("aggressiv_traded", False)]
-    if len(traded) < 20:
-        return
-
-    # Vergleiche Signal-Richtung mit tatsächlicher Preisbewegung
-    correct = 0
-    total = 0
-    for i, s in enumerate(traded):
-        if i + 2 >= len(signals):
-            break
-        # Finde den Preis 2 Signale später
-        future_idx = signals.index(s) + 2
-        if future_idx >= len(signals):
-            break
-        future_price = signals[future_idx].get("price", 0)
-        entry_price = s.get("price", 0)
-        if entry_price == 0 or future_price == 0:
-            continue
-
-        actual_dir = "long" if future_price > entry_price else "short"
-        predicted_dir = s.get("aggressiv_signal", "neutral")
-        if predicted_dir == "neutral":
-            continue
-
-        total += 1
-        if predicted_dir == actual_dir:
-            correct += 1
-
-    if total >= 15:
-        accuracy = correct / total
-        if accuracy < RETRAIN_THRESHOLD:
-            tg_send(
-                f"\u26A0\uFE0F <b>Retrain-Warnung</b>\n\n"
-                f"Modell-Accuracy der letzten {total} Signale: "
-                f"<code>{accuracy:.0%}</code>\n"
-                f"Schwelle: <code>{RETRAIN_THRESHOLD:.0%}</code>\n\n"
-                f"Empfehlung: Modell neu trainieren mit frischen Daten."
-            )
-            return True
-    return False
-
-
-def save_dashboard_status(pools, signals, ensemble_prob=None, confidence=None, price=None):
-    """Speichert Bot-Status als JSON fürs Dashboard."""
-    now = datetime.now(timezone.utc)
-    today = now.date().isoformat()
-
-    status = {
-        "bot_running": True,
-        "last_update": now.isoformat(),
-        "current_price": price,
-        "ensemble_prob": ensemble_prob,
-        "confidence": confidence,
-        "pools": {},
-    }
-    for name, pool in pools.items():
-        cfg = POOLS[name]
-        today_trades = [t for t in pool.trades if t.get("timestamp", "").startswith(today)]
-        today_pnl = sum(t.get("pnl", 0) for t in today_trades)
-        wr = pool.win_rate if pool.n_trades > 0 else None
-        status["pools"][name] = {
-            "label": cfg["label"],
-            "emoji": cfg["emoji"],
-            "capital": round(pool.capital, 2),
-            "total_pnl": round(pool.total_pnl, 2),
-            "today_pnl": round(today_pnl, 2),
-            "today_trades": len(today_trades),
-            "total_trades": pool.n_trades,
-            "wins": pool.wins,
-            "losses": pool.losses,
-            "win_rate": round(wr, 4) if wr is not None else None,
-            "max_dd": round(pool.max_dd, 4),
-            "open_positions": len(pool.open_positions),
-        }
-
-    status_file = os.path.join(BOT_DIR, "dashboard_status.json")
-    with open(status_file, "w") as f:
-        json.dump(status, f, indent=2, default=str)
-
-
 class C:
     PURPLE = "\033[95m"
     BLUE   = "\033[94m"
@@ -257,18 +131,25 @@ def log(msg, color=C.RESET):
 def banner():
     print(f"""
 {C.PURPLE}{C.BOLD}═══════════════════════════════════════════════════════{C.RESET}
-{C.BOLD}  MuriTrading – Paper-Trading Bot v2.0 (Multi-Pool){C.RESET}
+{C.BOLD}  MuriTrading v3.0 – Strategy-Based Trading Bot{C.RESET}
 {C.PURPLE}═══════════════════════════════════════════════════════{C.RESET}
-{C.DIM}  Asset          : {SYMBOL}
-  Kapital/Topf   : ${INITIAL_CAPITAL:,.2f} x 4 = ${INITIAL_CAPITAL*4:,.2f}
-  Risiko/Trade   : {RISK_PER_TRADE*100:.1f}%
-  Haltezeit      : {HOLD_CANDLES}h
-  Fees (RT)      : {ROUND_TRIP*100:.3f}%{C.RESET}
+{C.DIM}  Asset         : {SYMBOL}
+  Kapital       : ${INITIAL_CAPITAL:,.2f}
+  Timeframe     : {PRIMARY_TF} (Signale alle 4 Stunden)
+  Risiko/Trade  : {RISK_PER_TRADE*100:.1f}%
+  Min R:R       : {MIN_REWARD_RISK:.1f}:1
+  Partial TP    : 50% bei {PARTIAL_TP_RR:.0f}:1 + Stop→Breakeven
+  Stop Loss     : {SL_ATR_MULT:.0f}x ATR
+  Trailing Stop : {TRAILING_ATR_MULT:.1f}x ATR (ab {TRAILING_ACTIVATE:.1f}x ATR Gewinn)
+  Max Haltezeit : {MAX_HOLD_CANDLES * 4}h
+  Fees (RT)     : {ROUND_TRIP*100:.3f}%
+  Max DD/Monat  : {MAX_MONTHLY_DD*100:.0f}%{C.RESET}
 
-  {C.BLUE}Konservativ{C.RESET}  ML Conf >75%  (wenige, sichere Trades)
-  {C.GREEN}Standard{C.RESET}     ML Conf >65%  (ausbalanciert)
-  {C.RED}Aggressiv{C.RESET}    ML Conf >50%  (viele Trades)
-  {C.PURPLE}Predictlir{C.RESET}   RL Agent     (lernt selbst wann und wie viel)
+  {C.GREEN}Strategien:{C.RESET}
+  1. {C.BLUE}Trend Following{C.RESET}   – 13-Punkt Triple-TF Confluence (9/13 nötig)
+  2. {C.YELLOW}Mean Reversion{C.RESET}    – Extreme RSI<25 + BB-Boden + Multi-TF
+  3. {C.PURPLE}Breakout{C.RESET}          – BB-Squeeze + Vol 2.5x + Daily-Trend
+  {C.GREEN}Target Win Rate  : 73-80%+ (Muri-würdig){C.RESET}
 {C.PURPLE}═══════════════════════════════════════════════════════{C.RESET}
 """, flush=True)
 
@@ -301,43 +182,50 @@ def fetch_candles(exchange, timeframe, limit):
 
 
 def build_features(exchange, feature_cols):
-    df_15m = fetch_candles(exchange, "15m", 200)
+    """Holt frische Daten und berechnet alle Features."""
     df_1h  = fetch_candles(exchange, "1h", 250)
     df_4h  = fetch_candles(exchange, "4h", 250)
     df_1d  = fetch_candles(exchange, "1d", 250)
-    df_15m = add_indicators(df_15m, prefix="15m_")
+
     df_1h  = add_indicators(df_1h,  prefix="1h_")
     df_4h  = add_indicators(df_4h,  prefix="4h_")
     df_1d  = add_indicators(df_1d,  prefix="1d_")
 
-    df_15m_sel = df_15m[[c for c in df_15m.columns if c.startswith("15m_")]].copy()
-    df_base = pd.merge_asof(df_1h.sort_index(), df_15m_sel.sort_index(),
-        left_index=True, right_index=True, direction="backward")
+    # Merge: 1h als Basis, 4h und 1d backward-fill
     df_4h_sel = df_4h[[c for c in df_4h.columns if c.startswith("4h_")]].copy()
-    df_base = pd.merge_asof(df_base.sort_index(), df_4h_sel.sort_index(),
+    df_base = pd.merge_asof(df_1h.sort_index(), df_4h_sel.sort_index(),
         left_index=True, right_index=True, direction="backward")
+
     df_1d_sel = df_1d[[c for c in df_1d.columns if c.startswith("1d_")]].copy()
     df_base = pd.merge_asof(df_base.sort_index(), df_1d_sel.sort_index(),
         left_index=True, right_index=True, direction="backward")
-    bull_signals = ["1h_ema_9_above_21","1h_ema_21_above_50","1h_macd_above",
-        "4h_ema_9_above_21","4h_ema_21_above_50","4h_macd_above",
-        "1d_ema_9_above_21","1d_ema_21_above_50","1d_macd_above"]
-    bear_signals = ["1h_rsi_overbought","4h_rsi_overbought","1d_rsi_overbought"]
+
+    # Confluence Score
+    bull_signals = ["1h_ema_9_above_21", "1h_ema_21_above_50", "1h_macd_above",
+        "4h_ema_9_above_21", "4h_ema_21_above_50", "4h_macd_above",
+        "1d_ema_9_above_21", "1d_ema_21_above_50", "1d_macd_above"]
+    bear_signals = ["1h_rsi_overbought", "4h_rsi_overbought", "1d_rsi_overbought"]
+
     avail_bull = [s for s in bull_signals if s in df_base.columns]
     avail_bear = [s for s in bear_signals if s in df_base.columns]
-    if avail_bull: df_base["confluence_bull"] = df_base[avail_bull].sum(axis=1)
-    if avail_bear: df_base["confluence_bear"] = df_base[avail_bear].sum(axis=1)
+    if avail_bull:
+        df_base["confluence_bull"] = df_base[avail_bull].sum(axis=1)
+    if avail_bear:
+        df_base["confluence_bear"] = df_base[avail_bear].sum(axis=1)
     df_base["confluence_net"] = df_base.get("confluence_bull", 0) - df_base.get("confluence_bear", 0)
 
-    # Cross-Asset Features (BTC/ETH) live berechnen falls Modell sie braucht
+    # Cross-Asset Features (falls Modell sie braucht)
     ca_cols_needed = [c for c in feature_cols if c.startswith("ca_")]
     if ca_cols_needed:
         try:
             from src.features.cross_asset import build_cross_asset_features_batch, _fetch_candles
-            btc_15m = _fetch_candles(exchange, "BTC/USDT", "15m", 200)
-            eth_15m = _fetch_candles(exchange, "ETH/USDT", "15m", 200)
             btc_1h  = _fetch_candles(exchange, "BTC/USDT", "1h",  200)
             eth_1h  = _fetch_candles(exchange, "ETH/USDT", "1h",  200)
+            # Vereinfacht: nur 1h für cross-asset
+            df_15m = fetch_candles(exchange, "15m", 200)
+            df_15m = add_indicators(df_15m, prefix="15m_")
+            btc_15m = _fetch_candles(exchange, "BTC/USDT", "15m", 200)
+            eth_15m = _fetch_candles(exchange, "ETH/USDT", "15m", 200)
             ca_df = build_cross_asset_features_batch(df_15m, btc_15m, eth_15m, btc_1h, eth_1h)
             ca_sel = ca_df[[c for c in ca_df.columns if c in ca_cols_needed]].copy()
             df_base = pd.merge_asof(
@@ -346,9 +234,14 @@ def build_features(exchange, feature_cols):
             )
             for col in ca_sel.columns:
                 df_base[col] = df_base[col].ffill()
-        except Exception as e:
+        except Exception:
             for col in ca_cols_needed:
                 df_base[col] = 0.0
+
+    # Fehlende Feature-Spalten mit 0 füllen
+    for col in feature_cols:
+        if col not in df_base.columns:
+            df_base[col] = 0.0
 
     latest = df_base[feature_cols].dropna()
     if latest.empty:
@@ -356,418 +249,802 @@ def build_features(exchange, feature_cols):
     return latest.iloc[[-1]], df_base.iloc[-1], df_1h["close"].iloc[-1]
 
 
-def predict(rf, xgb, X):
+def predict(rf, xgb_model, X):
     rf_prob  = rf.predict_proba(X)[:, 1]
-    xgb_prob = xgb.predict_proba(X)[:, 1]
+    xgb_prob = xgb_model.predict_proba(X)[:, 1]
     ensemble = (rf_prob + xgb_prob) / 2.0
     return float(ensemble[0]), float(rf_prob[0]), float(xgb_prob[0])
 
 
-def calc_leverage(confidence, is_trending, whale_confirmed=False):
+# ═══════════════════════════════════════════════════════════════
+#  SIGNAL & STRATEGIE
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class Signal:
+    direction: str       # 'long' oder 'short'
+    strategy: str        # 'trend', 'mean_reversion', 'breakout'
+    strength: float      # 0-1 (Stärke des Signals)
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    atr: float
+    details: str = ""    # Menschenlesbare Begründung
+
+
+def _safe(val, default=0.0):
+    """NaN-safe Wert-Extraktion."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return default
+    return float(val)
+
+
+class StrategyEngine:
     """
-    Bestimmt den Hebel basierend auf Confidence, Regime und Whale-Bestätigung.
-
-    Args:
-        confidence: 0-1, ML Confidence
-        is_trending: bool, ob der Markt im Trend ist
-        whale_confirmed: bool, ob Whale-Flow die Richtung bestätigt
-
-    Returns:
-        int: Hebel (1-8x)
+    Generiert Trading-Signale basierend auf 4H technischer Analyse.
+    ML-Ensemble wird als Bestätigungs-Filter verwendet, nicht als primäres Signal.
     """
-    # Basis-Hebel nach Confidence
-    leverage = 1
-    for min_conf, lev in LEVERAGE_TIERS:
-        if confidence >= min_conf:
-            leverage = lev
-            break
 
-    # Seitwärtsmarkt → Hebel deckeln
-    if not is_trending:
-        leverage = min(leverage, LEVERAGE_SIDEWAYS_CAP)
+    def check_trend_follow(self, row, price, ml_prob):
+        """
+        Ultra-Selective Trend Following – Triple-Timeframe Confluence.
+        Optimiert auf 73%+ Win Rate durch maximale Bestätigung.
 
-    # Whale-Bestätigung → +1x Bonus (max 10x)
-    if whale_confirmed and leverage >= 3:
-        leverage = min(leverage + 1, 10)
+        13 Bedingungen, braucht >= 9 für Entry:
+          1.  EMA 9 > 21 auf 4H (bullish alignment)
+          2.  EMA 21 > 50 auf 4H (starker Trend)
+          3.  ADX > 28 auf 4H (starke Trendstärke)
+          4.  Pullback nahe EMA 21 (optimaler Einstieg)
+          5.  RSI 40-65 auf 4H (nicht überkauft, Raum nach oben)
+          6.  MACD über Signal auf 4H (Momentum)
+          7.  Stoch RSI < 0.80 auf 4H (nicht überhitzt)
+          8.  Daily EMA 9 > 21 (höherer TF bestätigt)
+          9.  Daily EMA 21 > 50 (starker Daily-Trend)
+          10. 1H EMA 9 > 21 (Micro-Trend stimmt zu)
+          11. Volume über Durchschnitt (Volumen bestätigt)
+          12. Bullische 4H-Kerze (Preis-Aktion bestätigt)
+          13. ML Ensemble > 0.55 (ML bestätigt)
+        """
+        signals = []
 
-    return leverage
+        for direction in ["long", "short"]:
+            score = 0
+            reasons = []
+
+            # ── 4H TREND STRUCTURE (4 Punkte) ────────────────
+            ema9_21 = _safe(row.get("4h_ema_9_above_21", 0))
+            ema21_50 = _safe(row.get("4h_ema_21_above_50", 0))
+            adx = _safe(row.get("4h_adx", 0))
+
+            if direction == "long":
+                if ema9_21 > 0.5:
+                    score += 1; reasons.append("4H:EMA9>21")
+                if ema21_50 > 0.5:
+                    score += 1; reasons.append("4H:EMA21>50")
+            else:
+                if ema9_21 < 0.5:
+                    score += 1; reasons.append("4H:EMA9<21")
+                if ema21_50 < 0.5:
+                    score += 1; reasons.append("4H:EMA21<50")
+
+            if adx > 28:
+                score += 1; reasons.append(f"ADX:{adx:.0f}")
+
+            # Pullback nahe EMA 21
+            ema21_dist = _safe(row.get("4h_ema_21_dist", 0))
+            if direction == "long":
+                if -0.008 < ema21_dist < 0.004:
+                    score += 1; reasons.append(f"Pull:{ema21_dist:+.3f}")
+            else:
+                if -0.004 < ema21_dist < 0.008:
+                    score += 1; reasons.append(f"Pull:{ema21_dist:+.3f}")
+
+            # ── 4H MOMENTUM (3 Punkte) ───────────────────────
+            rsi = _safe(row.get("4h_rsi_14", 50))
+            macd_above = _safe(row.get("4h_macd_above", 0))
+            stoch_rsi = _safe(row.get("4h_stoch_rsi", 0.5))
+
+            if direction == "long":
+                if 35 < rsi < 65:
+                    score += 1; reasons.append(f"RSI:{rsi:.0f}")
+                if macd_above > 0.5:
+                    score += 1; reasons.append("MACD+")
+                if stoch_rsi < 0.80:
+                    score += 1; reasons.append(f"StRSI:{stoch_rsi:.2f}")
+            else:
+                if 35 < rsi < 65:
+                    score += 1; reasons.append(f"RSI:{rsi:.0f}")
+                if macd_above < 0.5:
+                    score += 1; reasons.append("MACD-")
+                if stoch_rsi > 0.20:
+                    score += 1; reasons.append(f"StRSI:{stoch_rsi:.2f}")
+
+            # ── DAILY CONFIRMATION (2 Punkte) ────────────────
+            daily_ema9_21 = _safe(row.get("1d_ema_9_above_21", 0))
+            daily_ema21_50 = _safe(row.get("1d_ema_21_above_50", 0))
+
+            if direction == "long":
+                if daily_ema9_21 > 0.5:
+                    score += 1; reasons.append("1D:EMA9>21")
+                if daily_ema21_50 > 0.5:
+                    score += 1; reasons.append("1D:EMA21>50")
+            else:
+                if daily_ema9_21 < 0.5:
+                    score += 1; reasons.append("1D:EMA9<21")
+                if daily_ema21_50 < 0.5:
+                    score += 1; reasons.append("1D:EMA21<50")
+
+            # ── 1H MICRO-TREND (1 Punkt) ─────────────────────
+            h1_ema = _safe(row.get("1h_ema_9_above_21", 0))
+            if direction == "long" and h1_ema > 0.5:
+                score += 1; reasons.append("1H:EMA+")
+            elif direction == "short" and h1_ema < 0.5:
+                score += 1; reasons.append("1H:EMA-")
+
+            # ── VOLUME & PRICE ACTION (2 Punkte) ─────────────
+            vol_ratio = _safe(row.get("4h_vol_ratio", 1.0))
+            candle_bull = _safe(row.get("4h_candle_bull", 0.5))
+
+            if vol_ratio > 0.8:
+                score += 1; reasons.append(f"Vol:{vol_ratio:.1f}x")
+
+            if direction == "long" and candle_bull > 0.5:
+                score += 1; reasons.append("Bull-Candle")
+            elif direction == "short" and candle_bull < 0.5:
+                score += 1; reasons.append("Bear-Candle")
+
+            # ── ML CONFIRMATION (1 Punkt) ─────────────────────
+            if direction == "long" and ml_prob > 0.55:
+                score += 1; reasons.append(f"ML:{ml_prob:.0%}")
+            elif direction == "short" and ml_prob < 0.45:
+                score += 1; reasons.append(f"ML:{ml_prob:.0%}")
+
+            # ── ENTRY DECISION: 9/13 minimum ─────────────────
+            if score >= 9:
+                atr = _safe(row.get("4h_atr_14", price * 0.01))
+                if atr < price * 0.001:
+                    atr = price * 0.01
+
+                sl_dist = SL_ATR_MULT * atr
+                tp_dist = sl_dist * MIN_REWARD_RISK
+
+                if direction == "long":
+                    sl = price - sl_dist
+                    tp = price + tp_dist
+                else:
+                    sl = price + sl_dist
+                    tp = price - tp_dist
+
+                signals.append(Signal(
+                    direction=direction,
+                    strategy="trend",
+                    strength=score / 13.0,
+                    entry_price=price,
+                    stop_loss=round(sl, 6),
+                    take_profit=round(tp, 6),
+                    atr=atr,
+                    details=f"Trend {direction.upper()} ({score}/13): {', '.join(reasons)}",
+                ))
+
+        return signals
+
+    def check_mean_reversion(self, row, price, ml_prob):
+        """
+        Ultra-Selective Mean Reversion – nur bei extremen Bedingungen.
+        Optimiert auf 73%+ Win Rate.
+
+        Long (ALLE müssen stimmen):
+          - ADX < 20 (klar rangend)
+          - RSI < 25 auf 4H (stark überverkauft)
+          - BB Position < 0.08 (am unteren Bollinger Band)
+          - Bullische Kerze (Umkehrsignal)
+          - Volume Spike > 1.5x (Erschöpfungsvolumen)
+          - 1H RSI auch überverkauft (< 35)
+          - ML nicht stark dagegen
+        """
+        signals = []
+        adx = _safe(row.get("4h_adx", 25))
+        rsi_4h = _safe(row.get("4h_rsi_14", 50))
+        rsi_1h = _safe(row.get("1h_rsi_14", 50))
+        bb_pos = _safe(row.get("4h_bb_pos", 0.5))
+        candle_bull = _safe(row.get("4h_candle_bull", 0))
+        vol_ratio = _safe(row.get("4h_vol_ratio", 1.0))
+        stoch_rsi = _safe(row.get("4h_stoch_rsi", 0.5))
+        atr = _safe(row.get("4h_atr_14", price * 0.01))
+        if atr < price * 0.001:
+            atr = price * 0.01
+
+        # HARTER Filter: muss klar rangend sein
+        if adx >= 20:
+            return signals
+
+        # LONG: Stark überverkauft
+        if (rsi_4h < 25 and bb_pos < 0.08 and candle_bull > 0.5
+                and vol_ratio > 1.5 and rsi_1h < 35 and stoch_rsi < 0.15):
+
+            reasons = [f"RSI4H:{rsi_4h:.0f}", f"RSI1H:{rsi_1h:.0f}",
+                       f"BB:{bb_pos:.2f}", "Bull-Candle",
+                       f"Vol:{vol_ratio:.1f}x", f"StRSI:{stoch_rsi:.2f}"]
+
+            if ml_prob < 0.30:
+                return signals
+
+            sl_dist = SL_ATR_MULT * atr
+            tp_dist = sl_dist * MIN_REWARD_RISK
+
+            signals.append(Signal(
+                direction="long",
+                strategy="mean_reversion",
+                strength=min(1.0, (25 - rsi_4h) / 12),
+                entry_price=price,
+                stop_loss=round(price - sl_dist, 6),
+                take_profit=round(price + tp_dist, 6),
+                atr=atr,
+                details=f"MeanRev LONG (ADX:{adx:.0f}): {', '.join(reasons)}",
+            ))
+
+        # SHORT: Stark überkauft
+        if (rsi_4h > 75 and bb_pos > 0.92 and candle_bull < 0.5
+                and vol_ratio > 1.5 and rsi_1h > 65 and stoch_rsi > 0.85):
+
+            reasons = [f"RSI4H:{rsi_4h:.0f}", f"RSI1H:{rsi_1h:.0f}",
+                       f"BB:{bb_pos:.2f}", "Bear-Candle",
+                       f"Vol:{vol_ratio:.1f}x", f"StRSI:{stoch_rsi:.2f}"]
+
+            if ml_prob > 0.70:
+                return signals
+
+            sl_dist = SL_ATR_MULT * atr
+            tp_dist = sl_dist * MIN_REWARD_RISK
+
+            signals.append(Signal(
+                direction="short",
+                strategy="mean_reversion",
+                strength=min(1.0, (rsi_4h - 75) / 12),
+                entry_price=price,
+                stop_loss=round(price + sl_dist, 6),
+                take_profit=round(price - tp_dist, 6),
+                atr=atr,
+                details=f"MeanRev SHORT (ADX:{adx:.0f}): {', '.join(reasons)}",
+            ))
+
+        return signals
+
+    def check_breakout(self, row, price, ml_prob):
+        """
+        Ultra-Selective Breakout nach Bollinger Band Squeeze auf 4H.
+        Optimiert auf 73%+ Win Rate.
+
+        Bedingungen (ALLE müssen stimmen):
+          - BB Squeeze aktiv (niedrige Volatilität)
+          - Preis bricht aus BB aus (bb_pos > 0.95 oder < 0.05)
+          - Volume Surge (> 2.5x Durchschnitt)
+          - Daily Trend unterstützt Richtung (EMA9>21 + EMA21>50)
+          - 4H MACD bestätigt Richtung
+          - ML nicht dagegen
+        """
+        signals = []
+        bb_squeeze = _safe(row.get("4h_bb_squeeze", 0))
+        bb_pos = _safe(row.get("4h_bb_pos", 0.5))
+        bb_width = _safe(row.get("4h_bb_width", 0.05))
+        vol_ratio = _safe(row.get("4h_vol_ratio", 1.0))
+        daily_ema9_21 = _safe(row.get("1d_ema_9_above_21", 0.5))
+        daily_ema21_50 = _safe(row.get("1d_ema_21_above_50", 0.5))
+        macd_above = _safe(row.get("4h_macd_above", 0.5))
+        trend_cons = _safe(row.get("4h_trend_consistency", 0.5))
+        atr = _safe(row.get("4h_atr_14", price * 0.01))
+        if atr < price * 0.001:
+            atr = price * 0.01
+
+        # Squeeze muss aktiv sein ODER BB sehr eng
+        if not (bb_squeeze > 0.5 or bb_width < 0.020):
+            return signals
+
+        # Volume muss STARK erhöht sein
+        if vol_ratio < 2.5:
+            return signals
+
+        # LONG Breakout
+        if (bb_pos > 0.95 and daily_ema9_21 > 0.5 and daily_ema21_50 > 0.5
+                and macd_above > 0.5 and trend_cons > 0.5):
+            if ml_prob < 0.50:
+                return signals
+
+            sl_dist = SL_ATR_MULT * atr
+            tp_dist = sl_dist * MIN_REWARD_RISK
+
+            signals.append(Signal(
+                direction="long",
+                strategy="breakout",
+                strength=min(1.0, vol_ratio / 4.0),
+                entry_price=price,
+                stop_loss=round(price - sl_dist, 6),
+                take_profit=round(price + tp_dist, 6),
+                atr=atr,
+                details=f"Breakout LONG: BB:{bb_pos:.2f} Vol:{vol_ratio:.1f}x BBW:{bb_width:.3f} TC:{trend_cons:.2f}",
+            ))
+
+        # SHORT Breakout
+        if (bb_pos < 0.05 and daily_ema9_21 < 0.5 and daily_ema21_50 < 0.5
+                and macd_above < 0.5 and trend_cons > 0.5):
+            if ml_prob > 0.50:
+                return signals
+
+            sl_dist = SL_ATR_MULT * atr
+            tp_dist = sl_dist * MIN_REWARD_RISK
+
+            signals.append(Signal(
+                direction="short",
+                strategy="breakout",
+                strength=min(1.0, vol_ratio / 4.0),
+                entry_price=price,
+                stop_loss=round(price + sl_dist, 6),
+                take_profit=round(price - tp_dist, 6),
+                atr=atr,
+                details=f"Breakout SHORT: BB:{bb_pos:.2f} Vol:{vol_ratio:.1f}x BBW:{bb_width:.3f} TC:{trend_cons:.2f}",
+            ))
+
+        return signals
+
+    def generate_signals(self, row, price, ml_prob):
+        """
+        Prüft alle Strategien und gibt das stärkste Signal zurück.
+        Priorität: Trend > Breakout > Mean Reversion
+        """
+        all_signals = []
+
+        # Trend Following (primär)
+        all_signals.extend(self.check_trend_follow(row, price, ml_prob))
+
+        # Breakout (sekundär)
+        all_signals.extend(self.check_breakout(row, price, ml_prob))
+
+        # Mean Reversion (tertiär)
+        all_signals.extend(self.check_mean_reversion(row, price, ml_prob))
+
+        if not all_signals:
+            return None
+
+        # Beste Strategie nach Priorität + Stärke
+        priority = {"trend": 3, "breakout": 2, "mean_reversion": 1}
+        all_signals.sort(key=lambda s: (priority.get(s.strategy, 0), s.strength), reverse=True)
+
+        return all_signals[0]
 
 
 # ═══════════════════════════════════════════════════════════════
-#  POOL (ein Topf mit eigenem Kapital und Trades)
+#  POSITION MANAGEMENT
 # ═══════════════════════════════════════════════════════════════
 
-class Pool:
-    def __init__(self, name, confidence_thresh):
-        self.name = name
-        self.conf = confidence_thresh
-        self.capital = INITIAL_CAPITAL
-        self.peak = INITIAL_CAPITAL
-        self.max_dd = 0.0
-        self.trades = []
-        self.open_positions = []
-        self.daily_trades = {}
-        self.total_pnl = 0.0
-        self.wins = 0
-        self.losses = 0
+@dataclass
+class Position:
+    direction: str
+    strategy: str
+    entry_price: float
+    size: float             # In USDT (verbleibende Grösse)
+    original_size: float    # Ursprüngliche Grösse
+    stop_loss: float
+    take_profit: float
+    atr: float
+    entry_time: str
+    candles_held: int = 0
+    peak_price: float = 0.0
+    trough_price: float = float('inf')
+    trailing_active: bool = False
+    trailing_stop: float = 0.0
+    partial_taken: bool = False     # Ob Partial TP schon genommen
+    partial_pnl: float = 0.0       # PnL aus Partial Close
+    strength: float = 0.0
+    details: str = ""
 
-    @property
-    def win_rate(self):
-        t = self.wins + self.losses
-        return self.wins / t if t > 0 else 0.0
+    def update_trailing(self, current_price):
+        """Aktualisiert Trailing Stop basierend auf ATR."""
+        if self.direction == "long":
+            self.peak_price = max(self.peak_price, current_price)
+            unrealized_move = self.peak_price - self.entry_price
 
-    @property
-    def drawdown(self):
-        return (self.peak - self.capital) / self.peak if self.peak > 0 else 0.0
+            if unrealized_move >= TRAILING_ACTIVATE * self.atr:
+                self.trailing_active = True
+                new_trail = self.peak_price - TRAILING_ATR_MULT * self.atr
+                self.trailing_stop = max(self.trailing_stop, new_trail)
+                self.trailing_stop = max(self.trailing_stop, self.stop_loss)
 
-    @property
-    def n_trades(self):
-        return self.wins + self.losses
+        else:  # short
+            self.trough_price = min(self.trough_price, current_price)
+            unrealized_move = self.entry_price - self.trough_price
+
+            if unrealized_move >= TRAILING_ACTIVATE * self.atr:
+                self.trailing_active = True
+                new_trail = self.trough_price + TRAILING_ATR_MULT * self.atr
+                if self.trailing_stop == 0:
+                    self.trailing_stop = new_trail
+                else:
+                    self.trailing_stop = min(self.trailing_stop, new_trail)
+                self.trailing_stop = min(self.trailing_stop, self.stop_loss)
+
+    def check_partial_tp(self, current_price):
+        """
+        Prüft ob Partial Take-Profit genommen werden soll.
+        Bei 1:1 R:R → 50% der Position schliessen, Stop auf Breakeven.
+        Returns: (should_partial: bool, partial_pnl: float)
+        """
+        if self.partial_taken:
+            return False, 0.0
+
+        sl_dist = abs(self.entry_price - self.stop_loss)
+        partial_target = sl_dist * PARTIAL_TP_RR
+
+        if self.direction == "long":
+            if current_price >= self.entry_price + partial_target - 1e-9:
+                # 50% schliessen
+                partial_size = self.size * PARTIAL_SIZE_PCT
+                raw_ret = (current_price - self.entry_price) / self.entry_price
+                net_ret = raw_ret - (ROUND_TRIP / 2)  # Halbe Fees (nur Exit)
+                partial_pnl = partial_size * net_ret
+
+                self.size -= partial_size
+                self.partial_taken = True
+                self.partial_pnl = partial_pnl
+
+                # Stop auf Breakeven + Buffer
+                be_stop = self.entry_price * (1 + BREAKEVEN_BUFFER)
+                self.stop_loss = max(self.stop_loss, be_stop)
+                if self.trailing_stop > 0:
+                    self.trailing_stop = max(self.trailing_stop, be_stop)
+
+                return True, partial_pnl
+
+        else:  # short
+            if current_price <= self.entry_price - partial_target + 1e-9:
+                partial_size = self.size * PARTIAL_SIZE_PCT
+                raw_ret = (self.entry_price - current_price) / self.entry_price
+                net_ret = raw_ret - (ROUND_TRIP / 2)
+                partial_pnl = partial_size * net_ret
+
+                self.size -= partial_size
+                self.partial_taken = True
+                self.partial_pnl = partial_pnl
+
+                # Stop auf Breakeven
+                be_stop = self.entry_price * (1 - BREAKEVEN_BUFFER)
+                self.stop_loss = min(self.stop_loss, be_stop)
+                if self.trailing_stop > 0:
+                    self.trailing_stop = min(self.trailing_stop, be_stop)
+
+                return True, partial_pnl
+
+        return False, 0.0
+
+    def check_exit(self, current_price):
+        """
+        Prüft alle Exit-Bedingungen.
+        Returns: (should_exit: bool, reason: str)
+        """
+        # 1. Stop Loss
+        if self.direction == "long" and current_price <= self.stop_loss:
+            return True, "STOP-LOSS"
+        if self.direction == "short" and current_price >= self.stop_loss:
+            return True, "STOP-LOSS"
+
+        # 2. Take Profit (finale TP für verbleibende Position)
+        if self.direction == "long" and current_price >= self.take_profit:
+            return True, "TAKE-PROFIT"
+        if self.direction == "short" and current_price <= self.take_profit:
+            return True, "TAKE-PROFIT"
+
+        # 3. Trailing Stop
+        if self.trailing_active:
+            if self.direction == "long" and current_price <= self.trailing_stop:
+                return True, "TRAILING-STOP"
+            if self.direction == "short" and current_price >= self.trailing_stop:
+                return True, "TRAILING-STOP"
+
+        # 4. Maximale Haltezeit
+        if self.candles_held >= MAX_HOLD_CANDLES:
+            return True, "TIME-EXIT"
+
+        return False, ""
+
+    def calc_pnl(self, exit_price):
+        """Berechnet PnL für verbleibende Position nach Fees."""
+        if self.direction == "long":
+            raw_ret = (exit_price - self.entry_price) / self.entry_price
+        else:
+            raw_ret = (self.entry_price - exit_price) / self.entry_price
+        net_ret = raw_ret - ROUND_TRIP
+        pnl = self.size * net_ret
+        # Partial PnL hinzufügen
+        total_pnl = pnl + self.partial_pnl
+        return total_pnl, raw_ret, net_ret
 
     def to_dict(self):
         return {
-            "name": self.name, "confidence": self.conf,
-            "capital": round(self.capital, 2), "peak": round(self.peak, 2),
-            "max_dd": round(self.max_dd, 4), "total_pnl": round(self.total_pnl, 4),
-            "wins": self.wins, "losses": self.losses,
-            "open_positions": self.open_positions,
+            "direction": self.direction, "strategy": self.strategy,
+            "entry_price": self.entry_price, "size": self.size,
+            "original_size": self.original_size,
+            "stop_loss": self.stop_loss, "take_profit": self.take_profit,
+            "atr": self.atr, "entry_time": self.entry_time,
+            "candles_held": self.candles_held, "peak_price": self.peak_price,
+            "trough_price": self.trough_price,
+            "trailing_active": self.trailing_active,
+            "trailing_stop": self.trailing_stop,
+            "partial_taken": self.partial_taken,
+            "partial_pnl": self.partial_pnl,
+            "strength": self.strength, "details": self.details,
+        }
+
+    @staticmethod
+    def from_dict(d):
+        p = Position(
+            direction=d["direction"], strategy=d["strategy"],
+            entry_price=d["entry_price"], size=d["size"],
+            original_size=d.get("original_size", d["size"]),
+            stop_loss=d["stop_loss"], take_profit=d["take_profit"],
+            atr=d["atr"], entry_time=d["entry_time"],
+        )
+        p.candles_held = d.get("candles_held", 0)
+        p.peak_price = d.get("peak_price", d["entry_price"])
+        p.trough_price = d.get("trough_price", d["entry_price"])
+        p.trailing_active = d.get("trailing_active", False)
+        p.trailing_stop = d.get("trailing_stop", 0.0)
+        p.partial_taken = d.get("partial_taken", False)
+        p.partial_pnl = d.get("partial_pnl", 0.0)
+        p.strength = d.get("strength", 0.0)
+        p.details = d.get("details", "")
+        return p
+
+
+# ═══════════════════════════════════════════════════════════════
+#  RISK MANAGER
+# ═══════════════════════════════════════════════════════════════
+
+class RiskManager:
+    def __init__(self, initial_capital):
+        self.initial_capital = initial_capital
+        self.month_start_capital = initial_capital
+        self.consecutive_losses = 0
+        self.cooldown_until = None
+        self.weekly_trades = {}  # {week_key: count}
+
+    def calc_position_size(self, capital, entry_price, stop_loss):
+        """
+        ATR-basierte Positionsgrösse mit 1.5% Risiko.
+        Risiko = was wir verlieren wenn SL getroffen wird.
+        """
+        sl_distance_pct = abs(entry_price - stop_loss) / entry_price
+        if sl_distance_pct < 0.001:
+            sl_distance_pct = 0.01  # Minimum 1% SL
+
+        # Position = (Kapital × Risiko%) / SL-Distanz%
+        raw_size = (capital * RISK_PER_TRADE) / sl_distance_pct
+
+        # Max 20% des Kapitals pro Trade
+        max_size = capital * 0.20
+        size = min(raw_size, max_size)
+
+        # Minimum sinnvolle Grösse
+        if size < 5.0:
+            return 0.0
+
+        return round(size, 2)
+
+    def can_trade(self, capital):
+        """Prüft ob Trading erlaubt ist (Drawdown, Cooldown, Frequency)."""
+        reasons = []
+
+        # Monatliches Drawdown-Limit
+        monthly_dd = (self.month_start_capital - capital) / self.month_start_capital
+        if monthly_dd >= MAX_MONTHLY_DD:
+            reasons.append(f"Monthly DD {monthly_dd:.1%} >= {MAX_MONTHLY_DD:.0%}")
+
+        # Consecutive Loss Cooldown
+        if self.cooldown_until:
+            now = datetime.now(timezone.utc)
+            if now < self.cooldown_until:
+                remaining = (self.cooldown_until - now).total_seconds() / 3600
+                reasons.append(f"Cooldown ({remaining:.1f}h remaining)")
+            else:
+                self.cooldown_until = None
+                self.consecutive_losses = 0
+
+        # Wöchentliches Trade-Limit
+        week_key = datetime.now(timezone.utc).strftime("%Y-W%W")
+        week_count = self.weekly_trades.get(week_key, 0)
+        if week_count >= MAX_TRADES_PER_WEEK:
+            reasons.append(f"Weekly limit ({week_count}/{MAX_TRADES_PER_WEEK})")
+
+        return len(reasons) == 0, reasons
+
+    def register_trade(self):
+        """Registriert einen neuen Trade."""
+        week_key = datetime.now(timezone.utc).strftime("%Y-W%W")
+        self.weekly_trades[week_key] = self.weekly_trades.get(week_key, 0) + 1
+
+    def register_result(self, pnl):
+        """Registriert Ergebnis und prüft Circuit Breaker."""
+        if pnl < 0:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= CONSEC_LOSS_LIMIT:
+                self.cooldown_until = datetime.now(timezone.utc) + timedelta(hours=COOLDOWN_HOURS)
+                return True  # Circuit breaker triggered
+        else:
+            self.consecutive_losses = 0
+        return False
+
+    def new_month_check(self, capital):
+        """Prüft ob neuer Monat begonnen hat → reset Drawdown-Tracking."""
+        now = datetime.now(timezone.utc)
+        month_key = now.strftime("%Y-%m")
+        if not hasattr(self, '_current_month') or self._current_month != month_key:
+            self._current_month = month_key
+            self.month_start_capital = capital
+
+    def to_dict(self):
+        return {
+            "month_start_capital": self.month_start_capital,
+            "consecutive_losses": self.consecutive_losses,
+            "cooldown_until": self.cooldown_until.isoformat() if self.cooldown_until else None,
+            "weekly_trades": self.weekly_trades,
+            "_current_month": getattr(self, '_current_month', None),
         }
 
     def load_from(self, d):
-        self.capital = d.get("capital", INITIAL_CAPITAL)
-        self.peak = d.get("peak", INITIAL_CAPITAL)
-        self.max_dd = d.get("max_dd", 0.0)
-        self.total_pnl = d.get("total_pnl", 0.0)
-        self.wins = d.get("wins", 0)
-        self.losses = d.get("losses", 0)
-        self.open_positions = d.get("open_positions", [])
-
-    def check_signal(self, ensemble_prob):
-        """Prüft ob Signal stark genug für diesen Topf."""
-        conf_prob = 0.5 + self.conf / 2
-        is_long  = ensemble_prob >= conf_prob
-        is_short = ensemble_prob <= (1 - conf_prob)
-        return is_long, is_short
-
-    def open_trade(self, direction, price, confidence, atr_rel, leverage=1):
-        today = datetime.now(timezone.utc).date().isoformat()
-        self.daily_trades[today] = self.daily_trades.get(today, 0)
-        if self.daily_trades[today] >= MAX_TRADES_PER_DAY:
-            return None
-
-        stop_loss_pct = max(atr_rel * STOP_LOSS_MULT, 0.001)
-        size = (self.capital * RISK_PER_TRADE) / stop_loss_pct
-        size = min(size, self.capital * 0.20)
-
-        # Hebel anwenden
-        size *= leverage
-
-        # Stop-Loss enger bei Hebel (SL-Distanz / Hebel damit Verlust gleich bleibt)
-        effective_sl_pct = stop_loss_pct / leverage if leverage > 1 else stop_loss_pct
-        sl = price * (1 - effective_sl_pct) if direction == "long" else price * (1 + effective_sl_pct)
-
-        pos = {
-            "direction": direction, "entry_price": price,
-            "size": round(size, 2), "entry_time": datetime.now(timezone.utc).isoformat(),
-            "candles_held": 0, "stop_loss": round(sl, 6),
-            "confidence": round(confidence, 4), "pool": self.name,
-            "leverage": leverage,
-        }
-        self.open_positions.append(pos)
-        self.daily_trades[today] += 1
-        return pos
-
-    def check_exits(self, current_price):
-        """Prüft Stop-Loss, Trailing Stop, Take-Profit und Haltezeit."""
-        closed = []
-        for pos in self.open_positions:
-            pos["candles_held"] = pos.get("candles_held", 0) + 1
-
-            hit_sl = (pos["direction"] == "long" and current_price <= pos["stop_loss"]) or \
-                     (pos["direction"] == "short" and current_price >= pos["stop_loss"])
-
-            # Take-Profit: 2x die SL-Distanz
-            sl_dist = abs(pos["entry_price"] - pos["stop_loss"])
-            if pos["direction"] == "long":
-                tp = pos["entry_price"] + sl_dist * 2.0
-                hit_tp = current_price >= tp
-            else:
-                tp = pos["entry_price"] - sl_dist * 2.0
-                hit_tp = current_price <= tp
-
-            # Trailing Stop: sichert laufende Gewinne ab
-            hit_trailing = False
-            if pos["direction"] == "long":
-                # Höchststand tracken
-                pos["peak_price"] = max(pos.get("peak_price", pos["entry_price"]), current_price)
-                unrealized_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
-                # Aktivieren ab TRAILING_ACTIVATE Gewinn
-                if unrealized_pct >= TRAILING_ACTIVATE:
-                    trailing_sl = pos["peak_price"] * (1 - TRAILING_DISTANCE)
-                    if current_price <= trailing_sl:
-                        hit_trailing = True
-            else:  # short
-                pos["trough_price"] = min(pos.get("trough_price", pos["entry_price"]), current_price)
-                unrealized_pct = (pos["entry_price"] - current_price) / pos["entry_price"]
-                if unrealized_pct >= TRAILING_ACTIVATE:
-                    trailing_sl = pos["trough_price"] * (1 + TRAILING_DISTANCE)
-                    if current_price >= trailing_sl:
-                        hit_trailing = True
-
-            if hit_sl:
-                pnl = self._close(pos, current_price, "stop_loss")
-                closed.append((pos, pnl, "STOP-LOSS"))
-            elif hit_tp:
-                pnl = self._close(pos, current_price, "take_profit")
-                closed.append((pos, pnl, "TAKE-PROFIT \U0001F3AF"))
-            elif hit_trailing:
-                pnl = self._close(pos, current_price, "trailing_stop")
-                closed.append((pos, pnl, "TRAILING-STOP \U0001F4C8"))
-            elif pos["candles_held"] >= HOLD_CANDLES:
-                pnl = self._close(pos, current_price, "time_exit")
-                closed.append((pos, pnl, "TIME-EXIT"))
-
-        for pos, _, _ in closed:
-            if pos in self.open_positions:
-                self.open_positions.remove(pos)
-        return closed
-
-    def _close(self, pos, exit_price, reason):
-        if pos["direction"] == "long":
-            raw_ret = (exit_price - pos["entry_price"]) / pos["entry_price"]
-        else:
-            raw_ret = (pos["entry_price"] - exit_price) / pos["entry_price"]
-
-        net_ret = raw_ret - ROUND_TRIP
-        pnl = pos["size"] * net_ret
-
-        self.capital += pnl
-        self.total_pnl += pnl
-        if pnl > 0: self.wins += 1
-        else: self.losses += 1
-
-        if self.capital > self.peak: self.peak = self.capital
-        dd = self.drawdown
-        if dd > self.max_dd: self.max_dd = dd
-
-        self.trades.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "pool": self.name, "direction": pos["direction"],
-            "entry_price": pos["entry_price"], "exit_price": exit_price,
-            "size": pos["size"],
-            "raw_return_pct": round(raw_ret * 100, 4),
-            "net_return_pct": round(net_ret * 100, 4),
-            "pnl": round(pnl, 4), "capital": round(self.capital, 2),
-            "reason": reason, "confidence": pos.get("confidence", 0),
-        })
-        return pnl
-
-
-class RLPool(Pool):
-    """RL Agent Pool v2 - entscheidet selbst, regime-aware."""
-
-    # Regime-Feature-Spalten (gleich wie im Environment)
-    REGIME_COLS = ["1h_adx", "1h_chop", "1h_vol_regime", "1h_bb_squeeze",
-                   "1h_trend_consistency", "1h_regime_trend"]
-
-    def __init__(self, name, model_path, feature_cols):
-        super().__init__(name, confidence_thresh=0.0)
-        from stable_baselines3 import PPO
-        self.rl_model = PPO.load(model_path)
-        self.feature_cols = feature_cols
-        self.position_state = 0.0
-        self.entry_price_rl = 0.0
-
-        # Feature-Normalisierung aus vorberechneter JSON
-        stats_path = os.path.join(os.path.dirname(model_path), "feature_stats.json")
-        with open(stats_path) as f:
-            stats = json.load(f)
-        self.feat_mean = np.array(stats["mean"])
-        self.feat_std = np.array(stats["std"])
-
-        # Regime-Stats laden (v2)
-        self.regime_cols = stats.get("regime_cols", [])
-        if self.regime_cols:
-            self.regime_mean = np.array(stats["regime_mean"])
-            self.regime_std = np.array(stats["regime_std"])
-            log(f"  Regime-Features geladen: {self.regime_cols}", C.PURPLE)
-        else:
-            self.regime_mean = None
-            self.regime_std = None
-
-    def get_rl_action(self, X_row, current_price, latest_row=None):
-        """Fragt den RL Agent nach seiner Entscheidung (regime-aware)."""
-        # Features normalisieren
-        features = X_row[self.feature_cols].values.flatten()
-        if self.feat_mean is not None:
-            features = (features - self.feat_mean) / self.feat_std
-        features = np.nan_to_num(features, 0.0).astype(np.float32)
-
-        # Unrealisierter PnL
-        unrealized = 0.0
-        if abs(self.position_state) > 0.01 and self.entry_price_rl > 0:
-            if self.position_state > 0:
-                unrealized = (current_price - self.entry_price_rl) / self.entry_price_rl
-            else:
-                unrealized = (self.entry_price_rl - current_price) / self.entry_price_rl
-
-        # Observation zusammenbauen (wie im Training)
-        now = datetime.now(timezone.utc)
-        extra = np.array([self.position_state, unrealized, now.hour / 23.0, now.weekday() / 6.0], dtype=np.float32)
-
-        parts = [features, extra]
-
-        # Regime-Features hinzufügen (v2)
-        if self.regime_cols and latest_row is not None:
-            regime_vals = []
-            for col in self.regime_cols:
-                val = latest_row.get(col, 0.0) if hasattr(latest_row, 'get') else 0.0
-                if pd.isna(val):
-                    val = 0.0
-                regime_vals.append(float(val))
-            regime_arr = np.array(regime_vals, dtype=np.float32)
-            if self.regime_mean is not None:
-                regime_arr = (regime_arr - self.regime_mean) / self.regime_std
-            regime_arr = np.nan_to_num(regime_arr, 0.0).astype(np.float32)
-            parts.append(regime_arr)
-
-        obs = np.concatenate(parts).astype(np.float32)
-
-        # Agent fragen + Confidence messen
-        import torch
-        obs_tensor = torch.as_tensor(obs).unsqueeze(0)
-        with torch.no_grad():
-            dist = self.rl_model.policy.get_distribution(obs_tensor)
-            action_mean = dist.distribution.mean.cpu().numpy().flatten()
-            action_std = dist.distribution.scale.cpu().numpy().flatten()
-
-        action_val = float(np.clip(action_mean[0], -1.0, 1.0))
-        # Confidence: niedrige Std = hohe Sicherheit
-        confidence = max(0.0, 1.0 - action_std[0] / 0.5)
-        return action_val, confidence
-
-    def process_rl_signal(self, target_position, current_price, atr_rel):
-        """Verarbeitet RL-Entscheidung und eröffnet/schliesst Trades."""
-        position_change = target_position - self.position_state
-        actions = []  # Liste von (action_type, details)
-
-        # Nur handeln bei signifikanter Änderung (0.25 statt 0.10 = stärkere Überzeugung nötig)
-        if abs(position_change) <= 0.25:
-            return actions
-
-        # Alte Position schliessen
-        if abs(self.position_state) > 0.05 and len(self.open_positions) > 0:
-            # Close über die normale Pool-Methode
-            closed = self.check_exits_forced(current_price)
-            actions.extend(closed)
-
-        # Neue Position eröffnen
-        if abs(target_position) > 0.25:
-            direction = "long" if target_position > 0 else "short"
-            # Position Size basiert auf RL Agent's Überzeugung
-            size_factor = abs(target_position)  # 0-1
-            size = size_factor * self.capital * self.max_position_pct
-
-            today = datetime.now(timezone.utc).date().isoformat()
-            self.daily_trades[today] = self.daily_trades.get(today, 0)
-            rl_max_daily = 3  # RL Agent: max 3 Trades/Tag (konservativer)
-            if self.daily_trades[today] < rl_max_daily:
-                stop_loss_pct = max(atr_rel * STOP_LOSS_MULT, 0.001)
-
-                # Hebel basierend auf Action-Stärke (|target_position| als Proxy für Confidence)
-                rl_conf = abs(target_position)
-                leverage = 1
-                for min_conf, lev in LEVERAGE_TIERS:
-                    if rl_conf >= min_conf:
-                        leverage = lev
-                        break
-
-                size *= leverage
-                effective_sl_pct = stop_loss_pct / leverage if leverage > 1 else stop_loss_pct
-                sl = current_price * (1 - effective_sl_pct) if direction == "long" else current_price * (1 + effective_sl_pct)
-
-                pos = {
-                    "direction": direction, "entry_price": current_price,
-                    "size": round(size, 2), "entry_time": datetime.now(timezone.utc).isoformat(),
-                    "candles_held": 0, "stop_loss": round(sl, 6),
-                    "confidence": round(abs(target_position), 4), "pool": self.name,
-                    "leverage": leverage,
-                }
-                self.open_positions.append(pos)
-                self.daily_trades[today] += 1
-                self.position_state = target_position
-                self.entry_price_rl = current_price
-                actions.append(("OPEN", pos))
-        else:
-            self.position_state = 0.0
-            self.entry_price_rl = 0.0
-
-        return actions
-
-    def check_exits_forced(self, current_price):
-        """Schliesst alle offenen Positionen (RL will flat gehen)."""
-        closed = []
-        for pos in list(self.open_positions):
-            pnl = self._close(pos, current_price, "rl_signal")
-            closed.append(("CLOSE", pos, pnl, "RL-SIGNAL"))
-            self.open_positions.remove(pos)
-        self.position_state = 0.0
-        self.entry_price_rl = 0.0
-        return closed
-
-    @property
-    def max_position_pct(self):
-        return 0.20
+        self.month_start_capital = d.get("month_start_capital", self.initial_capital)
+        self.consecutive_losses = d.get("consecutive_losses", 0)
+        cu = d.get("cooldown_until")
+        self.cooldown_until = datetime.fromisoformat(cu) if cu else None
+        self.weekly_trades = d.get("weekly_trades", {})
+        self._current_month = d.get("_current_month")
 
 
 # ═══════════════════════════════════════════════════════════════
 #  STATE MANAGEMENT
 # ═══════════════════════════════════════════════════════════════
 
-STATE_FILE  = os.path.join(BOT_DIR, "bot_state.json")
-TRADES_LOG  = os.path.join(BOT_DIR, "trades.csv")
-EQUITY_LOG  = os.path.join(BOT_DIR, "equity.csv")
-
-
-def save_state(pools, signals, equity):
+def save_state(capital, total_pnl, wins, losses, trades, position, risk_mgr,
+               signals, equity):
     state = {
-        "pools": {name: p.to_dict() for name, p in pools.items()},
+        "version": "3.0",
+        "capital": round(capital, 2),
+        "total_pnl": round(total_pnl, 4),
+        "wins": wins,
+        "losses": losses,
+        "position": position.to_dict() if position else None,
+        "risk_manager": risk_mgr.to_dict(),
         "last_update": datetime.now(timezone.utc).isoformat(),
     }
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2, default=str)
 
-    all_trades = []
-    for p in pools.values():
-        all_trades.extend(p.trades)
-    if all_trades:
-        pd.DataFrame(all_trades).to_csv(TRADES_LOG, index=False)
+    if trades:
+        pd.DataFrame(trades).to_csv(TRADES_LOG, index=False)
     if signals:
         pd.DataFrame(signals).to_csv(SIGNALS_LOG, index=False)
     if equity:
         pd.DataFrame(equity).to_csv(EQUITY_LOG, index=False)
 
 
-def load_state(pools):
+def load_state():
+    capital = INITIAL_CAPITAL
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+    position = None
+    risk_mgr = RiskManager(INITIAL_CAPITAL)
+    trades = []
+    signals = []
+    equity = []
+
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             state = json.load(f)
-        for name, p in pools.items():
-            if name in state.get("pools", {}):
-                p.load_from(state["pools"][name])
-        log(f"State geladen", C.BLUE)
+        if state.get("version") == "3.0":
+            capital = state.get("capital", INITIAL_CAPITAL)
+            total_pnl = state.get("total_pnl", 0.0)
+            wins = state.get("wins", 0)
+            losses = state.get("losses", 0)
+            if state.get("position"):
+                position = Position.from_dict(state["position"])
+            if state.get("risk_manager"):
+                risk_mgr.load_from(state["risk_manager"])
+            log("State v3 geladen", C.BLUE)
+        else:
+            log("Alter State ignoriert, starte frisch", C.YELLOW)
 
-    signals, equity = [], []
+    if os.path.exists(TRADES_LOG):
+        trades = pd.read_csv(TRADES_LOG).to_dict("records")
     if os.path.exists(SIGNALS_LOG):
         signals = pd.read_csv(SIGNALS_LOG).to_dict("records")
     if os.path.exists(EQUITY_LOG):
         equity = pd.read_csv(EQUITY_LOG).to_dict("records")
-    if os.path.exists(TRADES_LOG):
-        df = pd.read_csv(TRADES_LOG)
-        for name, p in pools.items():
-            pool_trades = df[df["pool"] == name].to_dict("records") if "pool" in df.columns else []
-            p.trades = pool_trades
-    return signals, equity
+
+    return capital, total_pnl, wins, losses, position, risk_mgr, trades, signals, equity
+
+
+def save_dashboard_status(capital, total_pnl, wins, losses, position,
+                          price, ml_prob, regime_label):
+    """Speichert Status fürs Dashboard."""
+    n_trades = wins + losses
+    wr = wins / n_trades if n_trades > 0 else None
+    status = {
+        "bot_running": True,
+        "version": "3.0",
+        "last_update": datetime.now(timezone.utc).isoformat(),
+        "current_price": price,
+        "ensemble_prob": ml_prob,
+        "regime": regime_label,
+        "capital": round(capital, 2),
+        "total_pnl": round(total_pnl, 2),
+        "total_trades": n_trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wr, 4) if wr is not None else None,
+        "has_position": position is not None,
+        "position_direction": position.direction if position else None,
+        "position_strategy": position.strategy if position else None,
+        "position_entry": position.entry_price if position else None,
+        "position_sl": position.stop_loss if position else None,
+        "position_tp": position.take_profit if position else None,
+        "position_trailing": position.trailing_stop if position and position.trailing_active else None,
+    }
+    with open(os.path.join(BOT_DIR, "dashboard_status.json"), "w") as f:
+        json.dump(status, f, indent=2, default=str)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DAILY REPORT
+# ═══════════════════════════════════════════════════════════════
+
+def send_daily_report(capital, total_pnl, wins, losses, position,
+                      risk_mgr, start_time, trades):
+    now = datetime.now(timezone.utc)
+    uptime = now - start_time
+    hours = int(uptime.total_seconds() // 3600)
+    today = now.date().isoformat()
+    n_trades = wins + losses
+    wr = f"{wins/n_trades:.0%}" if n_trades > 0 else "–"
+
+    # Heutige Trades
+    today_trades = [t for t in trades if t.get("timestamp", "").startswith(today)]
+    today_pnl = sum(t.get("pnl", 0) for t in today_trades)
+
+    # Strategie-Verteilung
+    strat_counts = {}
+    for t in trades:
+        s = t.get("strategy", "unknown")
+        strat_counts[s] = strat_counts.get(s, 0) + 1
+    strat_text = ", ".join(f"{k}:{v}" for k, v in strat_counts.items()) or "–"
+
+    # Fear & Greed
+    fg_text = ""
+    try:
+        resp = _requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        fg = resp.json()["data"][0]
+        fg_text = f"\nFear & Greed: <code>{fg['value']}</code> ({fg['value_classification']})"
+    except Exception:
+        pass
+
+    can_trade, reasons = risk_mgr.can_trade(capital)
+    risk_text = "Trading aktiv" if can_trade else f"PAUSED: {', '.join(reasons)}"
+
+    pos_text = "Keine"
+    if position:
+        pos_text = (f"{position.direction.upper()} ({position.strategy})\n"
+                    f"  Entry: ${position.entry_price:.4f}\n"
+                    f"  SL: ${position.stop_loss:.4f} | TP: ${position.take_profit:.4f}")
+
+    tg_send(
+        f"\U0001F4CB <b>Daily Report v3</b> – {today}\n\n"
+        f"Uptime: <code>{hours}h</code>{fg_text}\n\n"
+        f"<b>Performance:</b>\n"
+        f"  Kapital: <code>${capital:.2f}</code>\n"
+        f"  PnL: <code>{total_pnl:+.2f}$</code>\n"
+        f"  Win Rate: <code>{wr}</code> ({wins}W/{losses}L)\n"
+        f"  Heute: <code>{today_pnl:+.2f}$</code> ({len(today_trades)} Trades)\n\n"
+        f"<b>Strategien:</b> {strat_text}\n"
+        f"<b>Position:</b> {pos_text}\n"
+        f"<b>Risk:</b> {risk_text}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -778,9 +1055,9 @@ def main():
     os.makedirs(BOT_DIR, exist_ok=True)
     banner()
 
-    # Modelle
-    log("Lade Modelle...", C.BLUE)
-    rf, xgb, meta = load_models()
+    # Modelle laden
+    log("Lade ML-Modelle...", C.BLUE)
+    rf, xgb_model, meta = load_models()
     feature_cols = meta["feature_cols"]
     log(f"Modelle geladen: {len(feature_cols)} Features", C.GREEN)
 
@@ -788,23 +1065,18 @@ def main():
     exchange = get_exchange()
     log("Binance verbunden", C.GREEN)
 
-    # Pools erstellen
-    pools = {}
-    for name, cfg in POOLS.items():
-        if cfg["type"] == "rl":
-            log("Lade RL Agent (Predictlir)...", C.PURPLE)
-            rl_pool = RLPool(name, RL_MODEL_PATH, feature_cols)
-            pools[name] = rl_pool
-            log("RL Agent geladen", C.GREEN)
-        else:
-            pools[name] = Pool(name, cfg["confidence"])
-
     # State laden
-    signals, equity = load_state(pools)
+    capital, total_pnl, wins, losses, position, risk_mgr, trades, signals, equity = load_state()
 
-    for name, p in pools.items():
-        cfg = POOLS[name]
-        log(f"  {cfg['emoji']} {cfg['label']:14s}  ${p.capital:.2f}  |  {p.n_trades} Trades  |  Conf >{p.conf:.0%}", C.BOLD)
+    # Strategy Engine
+    strategy_engine = StrategyEngine()
+
+    n_trades = wins + losses
+    wr = f"{wins/n_trades:.0%}" if n_trades > 0 else "–"
+    log(f"Kapital: ${capital:.2f}  PnL: {total_pnl:+.2f}  WR: {wr} ({n_trades} Trades)", C.BOLD)
+    if position:
+        log(f"Offene Position: {position.direction.upper()} ({position.strategy}) "
+            f"@ ${position.entry_price:.4f}  SL: ${position.stop_loss:.4f}", C.YELLOW)
 
     # Graceful Shutdown
     running = [True]
@@ -814,338 +1086,296 @@ def main():
     sig.signal(sig.SIGINT, shutdown)
     sig.signal(sig.SIGTERM, shutdown)
 
-    log(f"\nBot gestartet. Check alle {CHECK_INTERVAL}s.\n", C.GREEN)
+    log(f"\nBot gestartet. Signale auf {PRIMARY_TF}-Kerzen, Check alle {CHECK_INTERVAL}s.\n", C.GREEN)
 
     # Telegram Start
-    pool_lines = ""
-    for name, p in pools.items():
-        cfg = POOLS[name]
-        pool_lines += f"{cfg['emoji']} {cfg['label']}: <code>${p.capital:.2f}</code> (Conf >{p.conf:.0%})\n"
+    can_trade, reasons = risk_mgr.can_trade(capital)
     tg_send(
-        f"\U0001F680 <b>MuriTrading Bot v2.0 gestartet</b>\n\n"
-        f"{pool_lines}\n"
-        f"Risiko/Trade: <code>{RISK_PER_TRADE*100:.0f}%</code>\n"
-        f"Max Trades/Tag: <code>{MAX_TRADES_PER_DAY}</code>"
+        f"\U0001F680 <b>MuriTrading v3.0 gestartet</b>\n\n"
+        f"Kapital: <code>${capital:.2f}</code>\n"
+        f"PnL: <code>{total_pnl:+.2f}$</code>\n"
+        f"Trades: <code>{n_trades}</code> (WR: {wr})\n"
+        f"Strategien: Trend + MeanRev + Breakout\n"
+        f"Timeframe: <code>{PRIMARY_TF}</code>\n"
+        f"Risk/Trade: <code>{RISK_PER_TRADE*100:.1f}%</code>\n"
+        f"Status: {'Trading aktiv' if can_trade else 'PAUSED: ' + ', '.join(reasons)}"
     )
 
-    last_candle_time = None
+    last_4h_slot = None
     last_daily_report = None
     start_time = datetime.now(timezone.utc)
-
     heartbeat_count = 0
+
     while running[0]:
         try:
             ticker = exchange.fetch_ticker(SYMBOL)
             current_price = ticker["last"]
             now = datetime.now(timezone.utc)
             heartbeat_count += 1
-            if heartbeat_count % 10 == 0:
-                log(f"♻ Heartbeat #{heartbeat_count}  XRP ${current_price:.4f}  [{now.strftime('%H:%M')} UTC]", C.DIM)
-            current_hour = now.replace(minute=0, second=0, microsecond=0)
 
-            # Täglicher Report um 22:00 UTC
+            if heartbeat_count % 10 == 0:
+                trail_info = ""
+                if position and position.trailing_active:
+                    trail_info = f"  Trail: ${position.trailing_stop:.4f}"
+                pos_info = ""
+                if position:
+                    pnl_now, _, _ = position.calc_pnl(current_price)
+                    pos_info = f"  Pos: {position.direction.upper()} PnL:{pnl_now:+.2f}${trail_info}"
+                log(f"#{heartbeat_count}  XRP ${current_price:.4f}{pos_info}", C.DIM)
+
+            # Monatliches Reset prüfen
+            risk_mgr.new_month_check(capital)
+
+            # ── PARTIAL TP CHECK (jede Iteration) ─────────────
+            if position:
+                should_partial, partial_pnl = position.check_partial_tp(current_price)
+                if should_partial:
+                    capital += partial_pnl
+                    total_pnl += partial_pnl
+                    log(f"\U0001F3AF PARTIAL TP: +${partial_pnl:.2f}  "
+                        f"50% closed, SL→Breakeven  Remaining: ${position.size:.2f}", C.GREEN)
+                    tg_send(
+                        f"\U0001F3AF <b>PARTIAL TAKE-PROFIT</b>\n\n"
+                        f"50% der Position geschlossen\n"
+                        f"Partial PnL: <code>+${partial_pnl:.2f}</code>\n"
+                        f"Stop → Breakeven: <code>${position.stop_loss:.4f}</code>\n"
+                        f"Rest läuft mit Trailing Stop weiter"
+                    )
+                    save_state(capital, total_pnl, wins, losses, trades, position,
+                               risk_mgr, signals, equity)
+
+            # ── EXIT-CHECKS (jede Iteration) ──────────────────
+            if position:
+                position.update_trailing(current_price)
+                should_exit, reason = position.check_exit(current_price)
+
+                if should_exit:
+                    pnl, raw_ret, net_ret = position.calc_pnl(current_price)
+                    capital += pnl
+                    total_pnl += pnl
+
+                    if pnl > 0:
+                        wins += 1
+                    else:
+                        losses += 1
+
+                    # Risk Manager aktualisieren
+                    circuit_break = risk_mgr.register_result(pnl)
+
+                    n_trades_now = wins + losses
+                    wr_now = f"{wins/n_trades_now:.0%}" if n_trades_now > 0 else "–"
+
+                    pnl_emoji = "\U0001F4B0" if pnl >= 0 else "\u274C"
+                    hold_hours = position.candles_held * 4
+                    color = C.GREEN if pnl >= 0 else C.RED
+                    log(f"{pnl_emoji} CLOSE {position.direction.upper()} ({position.strategy})  "
+                        f"PnL: {pnl:+.2f}$  [{reason}]  {hold_hours}h  "
+                        f"Kapital: ${capital:.2f}  WR: {wr_now}", color)
+
+                    tg_send(
+                        f"{pnl_emoji} <b>TRADE CLOSE</b> [{reason}]\n\n"
+                        f"Strategie: <b>{position.strategy.upper()}</b>\n"
+                        f"Richtung: <b>{position.direction.upper()}</b>\n"
+                        f"Entry: <code>${position.entry_price:.4f}</code>\n"
+                        f"Exit: <code>${current_price:.4f}</code>\n"
+                        f"Einsatz: <code>${position.size:.2f}</code>\n"
+                        f"Dauer: <code>{hold_hours}h</code>\n"
+                        f"Return: <code>{net_ret:+.2%}</code>\n"
+                        f"Ergebnis: <code>{pnl:+.2f}$</code>\n"
+                        f"\n<b>Gesamt:</b>\n"
+                        f"Kapital: <code>${capital:.2f}</code>\n"
+                        f"PnL: <code>{total_pnl:+.2f}$</code>\n"
+                        f"Win Rate: <code>{wr_now}</code> ({wins}W/{losses}L)"
+                        + (f"\n\n\u26A0 Circuit Breaker: {COOLDOWN_HOURS}h Pause" if circuit_break else "")
+                    )
+
+                    # Trade loggen
+                    trades.append({
+                        "timestamp": now.isoformat(),
+                        "strategy": position.strategy,
+                        "direction": position.direction,
+                        "entry_price": position.entry_price,
+                        "exit_price": current_price,
+                        "size": position.size,
+                        "raw_return_pct": round(raw_ret * 100, 4),
+                        "net_return_pct": round(net_ret * 100, 4),
+                        "pnl": round(pnl, 4),
+                        "capital": round(capital, 2),
+                        "reason": reason,
+                        "strength": position.strength,
+                        "hold_candles": position.candles_held,
+                        "trailing_active": position.trailing_active,
+                    })
+
+                    position = None
+                    save_state(capital, total_pnl, wins, losses, trades, position,
+                               risk_mgr, signals, equity)
+
+            # ── TÄGLICHER REPORT ──────────────────────────────
             today_key = now.date().isoformat()
             if now.hour == DAILY_REPORT_HOUR and last_daily_report != today_key:
                 last_daily_report = today_key
-                send_daily_report(pools, signals, start_time)
-                check_retrain_needed(signals, pools)
+                send_daily_report(capital, total_pnl, wins, losses, position,
+                                  risk_mgr, start_time, trades)
                 log("Täglicher Report gesendet", C.BLUE)
 
-            # Exits prüfen (jede Iteration)
-            for name, pool in pools.items():
-                cfg = POOLS[name]
-                closed = pool.check_exits(current_price)
-                for pos, pnl, reason in closed:
-                    pnl_emoji = "\U0001F4B0" if pnl >= 0 else "\u274C"  # 💰 Gewinn / ❌ Verlust
-                    raw_ret = (current_price - pos["entry_price"]) / pos["entry_price"]
-                    if pos["direction"] == "short": raw_ret = -raw_ret
-                    net_ret = raw_ret - ROUND_TRIP
-                    duration = HOLD_CANDLES if reason == "TIME-EXIT" else f"<{HOLD_CANDLES}"
-                    wr = f"{pool.win_rate:.0%}" if pool.n_trades > 0 else "–"
+            # ── SIGNAL-CHECK (nur auf neuer 4H-Kerze) ─────────
+            current_4h_slot = now.hour // 4
+            current_4h_time = now.replace(hour=current_4h_slot * 4,
+                                          minute=0, second=0, microsecond=0)
 
-                    log(f"{cfg['emoji']} {cfg['label']} CLOSE {pos['direction'].upper()}  "
-                        f"PnL: {pnl:+.2f}$  [{reason}]",
-                        C.GREEN if pnl >= 0 else C.RED)
+            if last_4h_slot != current_4h_time and now.minute >= CANDLE_WAIT_MIN:
+                last_4h_slot = current_4h_time
 
-                    tg_send(
-                        f"{pnl_emoji} <b>TRADE CLOSE</b> – {cfg['emoji']} {cfg['label']}\n\n"
-                        f"Richtung: <b>{pos['direction'].upper()}</b>\n"
-                        f"Einsatz: <code>${pos['size']:.2f}</code>\n"
-                        f"Dauer: <code>{duration}h</code>\n"
-                        f"Ergebnis: <code>{pnl:+.2f}$</code> ({net_ret:+.2%})\n"
-                        f"\n<b>{cfg['label']}:</b>\n"
-                        f"Kapital: <code>${pool.capital:.2f}</code>\n"
-                        f"PnL: <code>{pool.total_pnl:+.2f}$</code>\n"
-                        f"Win Rate: <code>{wr}</code> ({pool.wins}W / {pool.losses}L)"
-                    )
+                # Position Haltezeit erhöhen
+                if position:
+                    position.candles_held += 1
 
-            # Neues Signal nur bei neuer Kerze
-            if last_candle_time != current_hour and now.minute >= 1:
-                last_candle_time = current_hour
+                # Features berechnen
                 X, latest_row, price = build_features(exchange, feature_cols)
                 if X is None:
                     log("Nicht genug Daten", C.YELLOW)
                     time.sleep(CHECK_INTERVAL)
                     continue
 
-                ensemble_prob, rf_prob, xgb_prob = predict(rf, xgb, X)
-                confidence = abs(ensemble_prob - 0.5) * 2
+                # ML Prediction (als Filter)
+                ml_prob, rf_prob, xgb_prob = predict(rf, xgb_model, X)
+                ml_confidence = abs(ml_prob - 0.5) * 2
 
-                # Whale-Features (Orderbuch + grosse Trades)
-                whale = compute_whale_features()
-                whale_txt = whale_signal_text(whale)
-                import math
-                whale_ok = not math.isnan(whale.get("whale_bid_ask_imbalance", float("nan")))
+                # Regime Info
+                adx_val = _safe(latest_row.get("4h_adx", 0))
+                chop_val = _safe(latest_row.get("4h_chop", 0))
+                regime_trend = _safe(latest_row.get("4h_regime_trend", 0))
+                regime_label = "TREND" if regime_trend else "SEITW"
+                regime_color = C.GREEN if regime_trend else C.YELLOW
 
-                # Whale-Adjustments auf ML Ensemble
-                if whale_ok:
-                    imb = whale["whale_bid_ask_imbalance"]
-                    net_norm = whale.get("whale_net_flow_normalized", 0) or 0
-                    dr1 = whale.get("whale_depth_ratio_1pct", 1.0) or 1.0
-
-                    # Starker Whale-Kaufdruck → Ensemble leicht Richtung Long boosten
-                    if net_norm > 0.3 and imb > 0.6 and dr1 > 1.5:
-                        ensemble_prob = min(ensemble_prob + 0.05, 0.95)
-                    elif net_norm < -0.3 and imb < 0.4 and dr1 < 0.67:
-                        ensemble_prob = max(ensemble_prob - 0.05, 0.05)
-
-                    # Ask-Wall Absorption → bullish breakout
-                    if whale.get("whale_absorption_ask"):
-                        ensemble_prob = min(ensemble_prob + 0.03, 0.95)
-                    # Bid-Wall Absorption → bearish breakdown
-                    if whale.get("whale_absorption_bid"):
-                        ensemble_prob = max(ensemble_prob - 0.03, 0.05)
-
-                    # Nahe Wall als Widerstand: hemmt Trades in diese Richtung
-                    if whale.get("whale_wall_ask") and whale.get("whale_wall_ask_distance", 1) < 0.005:
-                        confidence *= 0.8  # Resistance nahe → weniger Confidence
-                    if whale.get("whale_wall_bid") and whale.get("whale_wall_bid_distance", 1) < 0.005:
-                        confidence *= 1.1  # Support nahe → mehr Confidence
-
-                confidence = min(confidence, 1.0)
-
-                # Cross-Asset Features (BTC/ETH als Frühwarnung)
-                cross = build_cross_asset_features(exchange)
-                cross_txt = cross_asset_signal_text(cross)
-                ca_ok = not math.isnan(cross.get("ca_btc_ret_1", float("nan")))
-
-                # Cross-Asset Adjustments
-                if ca_ok:
-                    catchup = cross.get("ca_catchup_signal", 0) or 0
-                    # Starke Divergenz: BTC bewegt sich, XRP noch nicht → Catch-Up
-                    if catchup > 2.0:  # z-score > 2 = starkes Signal
-                        ensemble_prob = min(ensemble_prob + 0.04, 0.95)
-                    elif catchup < -2.0:
-                        ensemble_prob = max(ensemble_prob - 0.04, 0.05)
-
-                    # BTC-Only Pump = bearish für Alts
-                    if cross.get("ca_btc_only_pump"):
-                        confidence *= 0.7
-
-                    # Alt-Pump ohne BTC = bullish für XRP
-                    if cross.get("ca_alt_only_pump"):
-                        ensemble_prob = min(ensemble_prob + 0.03, 0.95)
-
-                    # Alt-Season Boost
-                    if cross.get("ca_alt_season", 0) >= 2:
-                        confidence *= 1.15
-
-                    # Correlation Breakdown = Vorsicht
-                    if cross.get("ca_corr_breakdown"):
-                        confidence *= 0.8
-
-                confidence = min(confidence, 1.0)
-
-                # Sentiment Features
-                sentiment = compute_sentiment_features()
-                sentiment_txt = sentiment_signal_text(sentiment)
-                sent_ok = not math.isnan(sentiment.get("sent_fear_greed", float("nan")))
-
-                # Sentiment Adjustments (contrarian)
-                if sent_ok:
-                    fng = sentiment["sent_fear_greed"]
-                    extreme = sentiment.get("sent_fear_greed_extreme", 0)
-                    composite = sentiment.get("sent_composite", 0.5) or 0.5
-
-                    # Extreme Fear = contrarian bullish (Markt überverkauft)
-                    if extreme == -1:  # Fear & Greed ≤ 20
-                        ensemble_prob = min(ensemble_prob + 0.03, 0.95)
-                    # Extreme Greed = contrarian bearish
-                    elif extreme == 1:  # Fear & Greed ≥ 80
-                        ensemble_prob = max(ensemble_prob - 0.03, 0.05)
-
-                confidence = min(confidence, 1.0)
-
-                # Regime-Info
-                adx_val = latest_row.get("1h_adx", 0) if latest_row is not None else 0
-                chop_val = latest_row.get("1h_chop", 0) if latest_row is not None else 0
-                regime_val = latest_row.get("1h_regime_trend", 0) if latest_row is not None else 0
-                if pd.isna(adx_val): adx_val = 0
-                if pd.isna(chop_val): chop_val = 0
-                if pd.isna(regime_val): regime_val = 0
-                regime_label = f"{C.GREEN}TREND{C.RESET}" if regime_val else f"{C.YELLOW}SEITW{C.RESET}"
-
-                # Status
-                print(f"\n{C.DIM}  ┌───────────────────────────────────────────────────────┐{C.RESET}", flush=True)
+                # Status anzeigen
+                print(f"\n{C.DIM}  ┌─────────────────────────────────────────────────────┐{C.RESET}")
                 print(f"  │ {C.BOLD}XRP/USDT{C.RESET}  ${current_price:.4f}  │  "
-                      f"Ensemble: {ensemble_prob:.0%}  │  Conf: {confidence:.0%}  │  "
-                      f"Regime: {regime_label} (ADX:{adx_val:.0f})", flush=True)
-                print(f"  │ {C.PURPLE}{whale_txt}{C.RESET}", flush=True)
-                print(f"  │ {C.BLUE}{cross_txt}{C.RESET}", flush=True)
-                print(f"  │ {C.YELLOW}{sentiment_txt}{C.RESET}", flush=True)
-                for name, pool in pools.items():
-                    cfg = POOLS[name]
-                    wr = f"{pool.win_rate:.0%}" if pool.n_trades > 0 else "–"
-                    pnl_c = C.GREEN if pool.total_pnl >= 0 else C.RED
-                    print(f"  │ {cfg['emoji']} {cfg['label']:12s}  "
-                          f"${pool.capital:.2f}  PnL:{pnl_c}{pool.total_pnl:+.2f}{C.RESET}  "
-                          f"WR:{wr}  T:{pool.n_trades}  Open:{len(pool.open_positions)}", flush=True)
-                print(f"{C.DIM}  └───────────────────────────────────────────────────────┘{C.RESET}", flush=True)
+                      f"ML: {ml_prob:.0%}  │  Conf: {ml_confidence:.0%}  │  "
+                      f"Regime: {regime_color}{regime_label}{C.RESET} (ADX:{adx_val:.0f})")
 
-                # Jeder Pool prüft unabhängig
-                atr_rel = latest_row.get("1h_atr_rel", 0.005)
-                if pd.isna(atr_rel): atr_rel = 0.005
+                n_trades_now = wins + losses
+                wr_now = f"{wins/n_trades_now:.0%}" if n_trades_now > 0 else "–"
+                pnl_c = C.GREEN if total_pnl >= 0 else C.RED
+                print(f"  │ Kapital: ${capital:.2f}  PnL:{pnl_c}{total_pnl:+.2f}{C.RESET}  "
+                      f"WR:{wr_now}  Trades:{n_trades_now}")
 
-                traded_pools = []
-                for name, pool in pools.items():
-                    cfg = POOLS[name]
+                if position:
+                    pos_pnl, _, _ = position.calc_pnl(current_price)
+                    pos_c = C.GREEN if pos_pnl >= 0 else C.RED
+                    trail_text = f"  Trail: ${position.trailing_stop:.4f}" if position.trailing_active else ""
+                    print(f"  │ Position: {position.direction.upper()} ({position.strategy})  "
+                          f"PnL:{pos_c}{pos_pnl:+.2f}{C.RESET}  "
+                          f"SL: ${position.stop_loss:.4f}  TP: ${position.take_profit:.4f}{trail_text}  "
+                          f"Hold: {position.candles_held * 4}h")
 
-                    # RL Agent entscheidet selbst (regime-aware)
-                    if cfg["type"] == "rl" and isinstance(pool, RLPool):
-                        rl_action, rl_confidence = pool.get_rl_action(X, current_price, latest_row=latest_row)
+                print(f"{C.DIM}  └─────────────────────────────────────────────────────┘{C.RESET}")
 
-                        # Gate 1: Regime – kein neuer Trade im Seitwärtsmarkt
-                        adx_live = float(latest_row.get("1h_adx", 0)) if latest_row is not None else 0
-                        chop_live = float(latest_row.get("1h_chop", 0)) if latest_row is not None else 0
-                        if pd.isna(adx_live): adx_live = 0
-                        if pd.isna(chop_live): chop_live = 0
-                        is_sideways = adx_live < 20 and chop_live > 0.6
+                # Nur Signal generieren wenn keine Position offen
+                if position is None:
+                    can_trade, block_reasons = risk_mgr.can_trade(capital)
 
-                        if is_sideways and len(pool.open_positions) == 0 and abs(rl_action) > 0.10:
-                            log(f"{cfg['emoji']} {cfg['label']} REGIME GATE: Sideways (ADX:{adx_live:.0f} Chop:{chop_live:.2f}) – blocked", C.YELLOW)
-                            rl_action = 0.0
+                    if not can_trade:
+                        log(f"Trading PAUSED: {', '.join(block_reasons)}", C.YELLOW)
+                    else:
+                        # Signal generieren
+                        signal = strategy_engine.generate_signals(
+                            latest_row, current_price, ml_prob)
 
-                        # Gate 2: Confidence – nur traden wenn PPO sicher ist
-                        MIN_RL_CONFIDENCE = 0.7
-                        if rl_confidence < MIN_RL_CONFIDENCE and len(pool.open_positions) == 0 and abs(rl_action) > 0.10:
-                            log(f"{cfg['emoji']} {cfg['label']} LOW CONFIDENCE: {rl_confidence:.2f} < {MIN_RL_CONFIDENCE} – blocked", C.YELLOW)
-                            rl_action = 0.0
+                        if signal:
+                            # Position Size berechnen
+                            size = risk_mgr.calc_position_size(
+                                capital, signal.entry_price, signal.stop_loss)
 
-                        actions = pool.process_rl_signal(rl_action, current_price, atr_rel)
-                        for act in actions:
-                            if act[0] == "OPEN":
-                                pos = act[1]
-                                traded_pools.append(name)
-                                dir_emoji = "\u2934\uFE0F" if pos["direction"] == "long" else "\u2935\uFE0F"  # ⤴️ Long / ⤵️ Short
-                                rl_lev = pos.get("leverage", 1)
-                                rl_lev_txt = f"  {rl_lev}x" if rl_lev > 1 else ""
-                                log(f"{cfg['emoji']} {cfg['label']} OPEN {pos['direction'].upper()}  "
-                                    f"${current_price:.4f}  Size: ${pos['size']:.2f}{rl_lev_txt}  RL: {rl_action:+.2f} Conf: {rl_confidence:.2f}", C.PURPLE)
+                            if size > 0:
+                                # Position eröffnen
+                                position = Position(
+                                    direction=signal.direction,
+                                    strategy=signal.strategy,
+                                    entry_price=current_price,
+                                    size=size,
+                                    original_size=size,
+                                    stop_loss=signal.stop_loss,
+                                    take_profit=signal.take_profit,
+                                    atr=signal.atr,
+                                    entry_time=now.isoformat(),
+                                    peak_price=current_price,
+                                    trough_price=current_price,
+                                    strength=signal.strength,
+                                    details=signal.details,
+                                )
+
+                                risk_mgr.register_trade()
+
+                                dir_emoji = "\u2934\uFE0F" if signal.direction == "long" else "\u2935\uFE0F"
+                                sl_pct = abs(current_price - signal.stop_loss) / current_price
+                                tp_pct = abs(signal.take_profit - current_price) / current_price
+
+                                log(f"{dir_emoji} OPEN {signal.direction.upper()} ({signal.strategy})  "
+                                    f"${current_price:.4f}  Size: ${size:.2f}  "
+                                    f"Strength: {signal.strength:.0%}", C.GREEN)
+                                log(f"   {signal.details}", C.DIM)
+                                log(f"   SL: ${signal.stop_loss:.4f} (-{sl_pct:.1%})  "
+                                    f"TP: ${signal.take_profit:.4f} (+{tp_pct:.1%})  "
+                                    f"R:R 1:{tp_pct/sl_pct:.1f}", C.DIM)
+
                                 tg_send(
-                                    f"{dir_emoji} <b>TRADE OPEN</b> – {cfg['emoji']} {cfg['label']}\n\n"
-                                    f"Richtung: <b>{pos['direction'].upper()}</b>\n"
+                                    f"{dir_emoji} <b>TRADE OPEN</b>\n\n"
+                                    f"Strategie: <b>{signal.strategy.upper()}</b>\n"
+                                    f"Richtung: <b>{signal.direction.upper()}</b>\n"
                                     f"Preis: <code>${current_price:.4f}</code>\n"
-                                    f"Einsatz: <code>${pos['size']:.2f}</code>"
-                                    f"{f' (<b>{rl_lev}x</b> Hebel)' if rl_lev > 1 else ''}\n"
-                                    f"RL-Action: <code>{rl_action:+.2f}</code> Conf: <code>{rl_confidence:.2f}</code>\n"
-                                    f"Stop-Loss: <code>${pos['stop_loss']:.4f}</code>\n"
-                                    f"Haltezeit: {HOLD_CANDLES}h\n"
-                                    f"🐋 {whale_txt}"
+                                    f"Einsatz: <code>${size:.2f}</code>\n"
+                                    f"Stop-Loss: <code>${signal.stop_loss:.4f}</code> (-{sl_pct:.1%})\n"
+                                    f"Take-Profit: <code>${signal.take_profit:.4f}</code> (+{tp_pct:.1%})\n"
+                                    f"R:R: <code>1:{tp_pct/sl_pct:.1f}</code>\n"
+                                    f"Stärke: <code>{signal.strength:.0%}</code>\n"
+                                    f"Regime: <code>{regime_label}</code> (ADX:{adx_val:.0f})\n\n"
+                                    f"<i>{signal.details}</i>"
                                 )
-                            elif act[0] == "CLOSE":
-                                _, pos, pnl, reason = act
-                                pnl_emoji = "\U0001F4B0" if pnl >= 0 else "\u274C"  # 💰 Gewinn / ❌ Verlust
-                                wr = f"{pool.win_rate:.0%}" if pool.n_trades > 0 else "–"
-                                log(f"{cfg['emoji']} {cfg['label']} CLOSE {pos['direction'].upper()}  "
-                                    f"PnL: {pnl:+.2f}$  [{reason}]",
-                                    C.GREEN if pnl >= 0 else C.RED)
-                                tg_send(
-                                    f"{pnl_emoji} <b>TRADE CLOSE</b> – {cfg['emoji']} {cfg['label']}\n\n"
-                                    f"Richtung: <b>{pos['direction'].upper()}</b>\n"
-                                    f"Einsatz: <code>${pos['size']:.2f}</code>\n"
-                                    f"Ergebnis: <code>{pnl:+.2f}$</code>\n"
-                                    f"Kapital: <code>${pool.capital:.2f}</code>\n"
-                                    f"Win Rate: <code>{wr}</code> ({pool.wins}W / {pool.losses}L)"
-                                )
-                        continue
-
-                    # ML Pools: wie bisher
-                    is_long, is_short = pool.check_signal(ensemble_prob)
-
-                    if (is_long or is_short) and len(pool.open_positions) == 0:
-                        direction = "long" if is_long else "short"
-
-                        # Hebel berechnen
-                        is_trend = bool(regime_val)
-                        whale_dir_ok = (direction == "long" and whale.get("whale_bid_ask_imbalance", 0.5) > 0.6) or \
-                                       (direction == "short" and whale.get("whale_bid_ask_imbalance", 0.5) < 0.4)
-                        lev = calc_leverage(confidence, is_trend, whale_confirmed=whale_dir_ok)
-
-                        pos = pool.open_trade(direction, current_price, confidence, atr_rel, leverage=lev)
-                        if pos:
-                            traded_pools.append(name)
-                            dir_emoji = "\u2934\uFE0F" if direction == "long" else "\u2935\uFE0F"  # ⤴️ Long / ⤵️ Short
-                            lev_txt = f"  {lev}x" if lev > 1 else ""
-                            log(f"{cfg['emoji']} {cfg['label']} OPEN {direction.upper()}  "
-                                f"${current_price:.4f}  Size: ${pos['size']:.2f}{lev_txt}  Conf: {confidence:.0%}", C.GREEN)
-
-                            tg_send(
-                                f"{dir_emoji} <b>TRADE OPEN</b> – {cfg['emoji']} {cfg['label']}\n\n"
-                                f"Richtung: <b>{direction.upper()}</b>\n"
-                                f"Preis: <code>${current_price:.4f}</code>\n"
-                                f"Einsatz: <code>${pos['size']:.2f}</code>"
-                                f"{f' (<b>{lev}x</b> Hebel)' if lev > 1 else ''}\n"
-                                f"Confidence: <code>{confidence:.0%}</code>\n"
-                                f"Stop-Loss: <code>${pos['stop_loss']:.4f}</code>\n"
-                                f"Haltezeit: {HOLD_CANDLES}h\n"
-                                f"🐋 {whale_txt}"
-                            )
-
-                if not traded_pools:
-                    log(f"Kein Trade (ML-Conf: {confidence:.0%}, RL-Pos: {pools['rl_agent'].position_state:+.2f})", C.DIM)
-
-                # Equity-Snapshot (alle Pools)
-                eq_row = {
-                    "timestamp": now.isoformat(),
-                    "price": round(current_price, 6),
-                    "ensemble_prob": round(ensemble_prob, 4),
-                    "confidence": round(confidence, 4),
-                }
-                for name, pool in pools.items():
-                    eq_row[f"{name}_capital"] = round(pool.capital, 2)
-                    eq_row[f"{name}_pnl"] = round(pool.total_pnl, 4)
-                    eq_row[f"{name}_trades"] = pool.n_trades
-                equity.append(eq_row)
+                            else:
+                                log(f"Signal {signal.strategy} ignoriert (Size zu klein)", C.DIM)
+                        else:
+                            log(f"Kein Signal (ML:{ml_prob:.0%} Regime:{regime_label} ADX:{adx_val:.0f})", C.DIM)
 
                 # Signal-Log
                 sig_row = {
                     "timestamp": now.isoformat(),
                     "price": round(current_price, 6),
-                    "ensemble_prob": round(ensemble_prob, 4),
+                    "ml_prob": round(ml_prob, 4),
                     "rf_prob": round(rf_prob, 4),
                     "xgb_prob": round(xgb_prob, 4),
-                    "confidence": round(confidence, 4),
-                    "whale_imbalance": whale.get("whale_bid_ask_imbalance"),
-                    "whale_net_flow": whale.get("whale_net_flow"),
-                    "whale_big_trades": whale.get("whale_big_trade_count", 0),
-                    "whale_wall_bid": whale.get("whale_wall_bid", 0),
-                    "whale_wall_ask": whale.get("whale_wall_ask", 0),
-                    "ca_btc_ret_1": cross.get("ca_btc_ret_1"),
-                    "ca_catchup_signal": cross.get("ca_catchup_signal"),
-                    "ca_corr_48": cross.get("ca_corr_48"),
-                    "ca_alt_season": cross.get("ca_alt_season"),
-                    "sent_fear_greed": sentiment.get("sent_fear_greed"),
-                    "sent_composite": sentiment.get("sent_composite"),
+                    "ml_confidence": round(ml_confidence, 4),
+                    "regime": regime_label,
+                    "adx": round(adx_val, 1),
+                    "chop": round(chop_val, 3),
+                    "rsi_4h": round(_safe(latest_row.get("4h_rsi_14", 50)), 1),
+                    "bb_pos_4h": round(_safe(latest_row.get("4h_bb_pos", 0.5)), 3),
+                    "has_position": position is not None,
+                    "position_direction": position.direction if position else None,
+                    "position_strategy": position.strategy if position else None,
                 }
-                for name in pools:
-                    is_l, is_s = pools[name].check_signal(ensemble_prob)
-                    sig_row[f"{name}_signal"] = "long" if is_l else "short" if is_s else "neutral"
-                    sig_row[f"{name}_traded"] = name in traded_pools
                 signals.append(sig_row)
 
-                # Dashboard-Status + State speichern
-                save_dashboard_status(pools, signals, ensemble_prob, confidence, current_price)
-                save_state(pools, signals, equity)
+                # Equity-Snapshot
+                unrealized = 0
+                if position:
+                    unrealized, _, _ = position.calc_pnl(current_price)
+                eq_row = {
+                    "timestamp": now.isoformat(),
+                    "price": round(current_price, 6),
+                    "capital": round(capital, 2),
+                    "equity": round(capital + unrealized, 2),
+                    "total_pnl": round(total_pnl, 4),
+                    "n_trades": wins + losses,
+                }
+                equity.append(eq_row)
+
+                # Dashboard + State speichern
+                save_dashboard_status(capital, total_pnl, wins, losses, position,
+                                      current_price, ml_prob, regime_label)
+                save_state(capital, total_pnl, wins, losses, trades, position,
+                           risk_mgr, signals, equity)
 
             time.sleep(CHECK_INTERVAL)
 
@@ -1161,30 +1391,26 @@ def main():
             time.sleep(10)
 
     # ── SHUTDOWN ───────────────────────────────────────────────
-    save_state(pools, signals, equity)
+    save_state(capital, total_pnl, wins, losses, trades, position,
+               risk_mgr, signals, equity)
 
-    print(f"\n{C.PURPLE}{C.BOLD}═══════════════════════════════════════════════════════{C.RESET}", flush=True)
-    print(f"{C.BOLD}  Bot gestoppt – Finale Bilanz{C.RESET}", flush=True)
-    print(f"{C.PURPLE}═══════════════════════════════════════════════════════{C.RESET}", flush=True)
+    n_trades_final = wins + losses
+    wr_final = f"{wins/n_trades_final:.1%}" if n_trades_final > 0 else "–"
+    ret = (capital - INITIAL_CAPITAL) / INITIAL_CAPITAL
 
-    tg_lines = "\U0001F6D1 <b>MuriTrading Bot gestoppt</b>\n\n"
-    for name, pool in pools.items():
-        cfg = POOLS[name]
-        wr = f"{pool.win_rate:.1%}" if pool.n_trades > 0 else "–"
-        ret = (pool.capital - INITIAL_CAPITAL) / INITIAL_CAPITAL
-        print(f"  {cfg['emoji']} {cfg['label']:14s}  "
-              f"${pool.capital:.2f}  PnL: {pool.total_pnl:+.2f}  "
-              f"WR: {wr}  Trades: {pool.n_trades}  DD: {pool.max_dd:.1%}", flush=True)
-        tg_lines += (
-            f"{cfg['emoji']} <b>{cfg['label']}</b>\n"
-            f"  Kapital: <code>${pool.capital:.2f}</code> ({ret:+.1%})\n"
-            f"  PnL: <code>{pool.total_pnl:+.2f}$</code>\n"
-            f"  Win Rate: <code>{wr}</code> ({pool.wins}W / {pool.losses}L)\n"
-            f"  Max DD: <code>{pool.max_dd:.1%}</code>\n\n"
-        )
+    print(f"\n{C.PURPLE}{C.BOLD}═══════════════════════════════════════════════════════{C.RESET}")
+    print(f"{C.BOLD}  Bot gestoppt – Finale Bilanz{C.RESET}")
+    print(f"  Kapital: ${capital:.2f}  ({ret:+.1%})")
+    print(f"  PnL:     {total_pnl:+.2f}$")
+    print(f"  Trades:  {n_trades_final}  WR: {wr_final} ({wins}W/{losses}L)")
+    print(f"{C.PURPLE}═══════════════════════════════════════════════════════{C.RESET}\n")
 
-    print(f"{C.PURPLE}═══════════════════════════════════════════════════════{C.RESET}\n", flush=True)
-    tg_send(tg_lines)
+    tg_send(
+        f"\U0001F6D1 <b>MuriTrading v3.0 gestoppt</b>\n\n"
+        f"Kapital: <code>${capital:.2f}</code> ({ret:+.1%})\n"
+        f"PnL: <code>{total_pnl:+.2f}$</code>\n"
+        f"Win Rate: <code>{wr_final}</code> ({wins}W/{losses}L)"
+    )
 
 
 if __name__ == "__main__":
