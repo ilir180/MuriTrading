@@ -18,6 +18,12 @@ import os as _os
 _os.environ.setdefault("OMP_NUM_THREADS", "1")
 _os.environ.setdefault("MKL_NUM_THREADS", "1")
 
+# Windows: default stdout is cp1252 and crashes on emojis. Force UTF-8.
+import sys as _sys
+if hasattr(_sys.stdout, "reconfigure"):
+    _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import os
 import sys
 import time
