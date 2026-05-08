@@ -108,9 +108,32 @@ class JV2Bot(ABC):
         entry_info = None
         if signal.direction != "neutral" and signal.confidence >= MIN_CONFIDENCE:
             if self.state.position is None and self._can_trade():
-                entry_info = self._open_position(signal, market_data["price"], market_data["atr_4h"])
+                regime = self._snapshot_regime(market_data)
+                entry_info = self._open_position(
+                    signal, market_data["price"], market_data["atr_4h"], regime)
 
         return signal, entry_info, thesis_exit
+
+    # ── REGIME SNAPSHOT ──────────────────────────────
+    # Captured at entry time, persisted on the position, copied to TradeRecord at close.
+    # Drives per-regime stats for the Coach / promotion logic.
+    def _snapshot_regime(self, market_data: dict) -> dict:
+        r4 = market_data.get("latest_4h")
+        sent = market_data.get("sentiment", {}) or {}
+        price = market_data.get("price", 0.0)
+        atr = market_data.get("atr_4h", 0.0)
+        if r4 is None:
+            return {}
+        return {
+            "adx": _safe(r4.get("4h_adx")),
+            "rsi": _safe(r4.get("4h_rsi_14"), 50.0),
+            "bb_pos": _safe(r4.get("4h_bb_pos"), 0.5),
+            "bbw": _safe(r4.get("4h_bb_width")),
+            "atr_pct": (atr / price * 100) if price > 0 else 0.0,
+            "chop": _safe(r4.get("4h_chop")),
+            "trend_consistency": _safe(r4.get("4h_trend_consistency")),
+            "fear_greed": _safe(sent.get("fear_greed"), 50.0),
+        }
 
     # ── RISK CHECK ───────────────────────────────────
 
@@ -131,7 +154,7 @@ class JV2Bot(ABC):
 
     # ── OPEN POSITION ────────────────────────────────
 
-    def _open_position(self, signal, price, atr):
+    def _open_position(self, signal, price, atr, regime: dict = None):
         rp = self.risk_profile
         # Katastrophen-Stop: weit weg (4 ATR), primärer Exit ist check_thesis()
         catastrophe_sl_atr = max(rp["sl_atr"], 4.0)
@@ -164,6 +187,7 @@ class JV2Bot(ABC):
             take_profit=round(tp, 6),
             atr=atr,
             entry_time=datetime.now(timezone.utc).isoformat(),
+            regime=regime or {},
         )
         self.state.position._max_hold = rp["max_hold"]
         self.state.trades_this_week += 1
@@ -189,6 +213,7 @@ class JV2Bot(ABC):
                     datetime.now(timezone.utc) + timedelta(hours=COOLDOWN_HOURS)
                 ).isoformat()
 
+        rg = pos.regime or {}
         record = TradeRecord(
             timestamp=datetime.now(timezone.utc).isoformat(),
             bot_id=self.bot_id,
@@ -201,6 +226,14 @@ class JV2Bot(ABC):
             reason=reason,
             hold_candles=pos.candles_held,
             bot_capital_after=round(self.state.capital, 2),
+            regime_adx=float(rg.get("adx", 0.0)),
+            regime_rsi=float(rg.get("rsi", 0.0)),
+            regime_bb_pos=float(rg.get("bb_pos", 0.0)),
+            regime_bbw=float(rg.get("bbw", 0.0)),
+            regime_atr_pct=float(rg.get("atr_pct", 0.0)),
+            regime_chop=float(rg.get("chop", 0.0)),
+            regime_trend_consistency=float(rg.get("trend_consistency", 0.0)),
+            regime_fear_greed=float(rg.get("fear_greed", 0.0)),
         )
 
         self.state.position = None

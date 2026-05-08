@@ -56,6 +56,7 @@ class BotPosition:
     trough_price: float = 0.0
     trailing_active: bool = False
     trailing_stop: float = 0.0
+    regime: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.peak_price == 0.0:
@@ -142,16 +143,32 @@ class TradeRecord:
     reason: str
     hold_candles: int
     bot_capital_after: float
+    # Regime snapshot at entry time — feeds Coach / promotion logic.
+    regime_adx: float = 0.0
+    regime_rsi: float = 0.0
+    regime_bb_pos: float = 0.0
+    regime_bbw: float = 0.0
+    regime_atr_pct: float = 0.0
+    regime_chop: float = 0.0
+    regime_trend_consistency: float = 0.0
+    regime_fear_greed: float = 0.0
 
     def to_csv_row(self):
         return (f"{self.timestamp},{self.bot_id},{self.direction},"
                 f"{self.entry_price:.6f},{self.exit_price:.6f},"
                 f"{self.size_usd:.2f},{self.pnl:.4f},{self.net_return_pct:.4f},"
-                f"{self.reason},{self.hold_candles},{self.bot_capital_after:.2f}")
+                f"{self.reason},{self.hold_candles},{self.bot_capital_after:.2f},"
+                f"{self.regime_adx:.2f},{self.regime_rsi:.2f},"
+                f"{self.regime_bb_pos:.4f},{self.regime_bbw:.4f},"
+                f"{self.regime_atr_pct:.4f},{self.regime_chop:.4f},"
+                f"{self.regime_trend_consistency:.4f},{self.regime_fear_greed:.1f}")
 
     @staticmethod
     def csv_header():
-        return "timestamp,bot_id,direction,entry_price,exit_price,size_usd,pnl,net_return_pct,reason,hold_candles,bot_capital_after"
+        return ("timestamp,bot_id,direction,entry_price,exit_price,size_usd,pnl,"
+                "net_return_pct,reason,hold_candles,bot_capital_after,"
+                "regime_adx,regime_rsi,regime_bb_pos,regime_bbw,"
+                "regime_atr_pct,regime_chop,regime_trend_consistency,regime_fear_greed")
 
 
 @dataclass
