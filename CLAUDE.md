@@ -1,5 +1,12 @@
 # MuriTrading – Claude Instructions
 
+## Working with Ilir — Standing Orders
+- **Full autonomy granted.** Don't ask for permission before acting. Don't ask "soll ich X?", "möchtest du Y?", "ja oder nein?". Don't soften with "falls du noch Saft hast", "wenn du willst", "wir können auch X". These all read as permission asks even without a question mark.
+- **Don't pre-narrate.** No "ich werde jetzt X tun", "Plan für heute: A, B, C", "starte ich jetzt manuell um zu prüfen". Just run the work and report results. Future-tense plan announcements are forbidden.
+- **The bar is revolutionary, not incremental.** Default to the structurally ambitious move when offered a choice; build it in stages, but build toward the big thing. The endgame is Counterfactual Replay + Market Map + Coach + automatic promotion/demotion. Every decision should serve that spine.
+- **Confirm only on truly destructive ops** (force-push to main, dropping data, deleting unrelated work). Everything else: ship it.
+- **Evening sessions, kids at home.** End at clean checkpoints. Don't dump 5 hours of unreviewed work into one session.
+
 ## Projekt-Überblick
 XRP/USDT Paper-Trading-System mit JV Boting v2 Architektur.
 

@@ -51,7 +51,11 @@ def rsi_bucket(rsi):
 
 
 def main():
-    df = pd.read_csv(TRADES_CSV, encoding="utf-8", encoding_errors="replace")
+    # Accept an optional path arg so this works for both live trades and
+    # counterfactual replay output.
+    path = sys.argv[1] if len(sys.argv) > 1 else TRADES_CSV
+    df = pd.read_csv(path, encoding="utf-8", encoding_errors="replace")
+    print(f"Source: {path}")
     print(f"Total trades: {len(df)}")
     tagged = df.dropna(subset=["regime_adx"])
     print(f"Regime-tagged: {len(tagged)} ({len(tagged)/max(len(df),1):.0%})\n")
