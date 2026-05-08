@@ -136,6 +136,7 @@ def _record_to_dict(t: TradeRecord) -> dict:
         "regime_atr_pct": t.regime_atr_pct, "regime_chop": t.regime_chop,
         "regime_trend_consistency": t.regime_trend_consistency,
         "regime_fear_greed": t.regime_fear_greed,
+        "regime_cluster": t.regime_cluster,
     }
 
 

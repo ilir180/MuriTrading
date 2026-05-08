@@ -18,6 +18,18 @@ def _safe(val, default=0.0):
     return float(val)
 
 
+# Lazy-loaded singleton — clusterer model lives on disk.
+_REGIME_CLUSTERER = None
+
+
+def _get_clusterer():
+    global _REGIME_CLUSTERER
+    if _REGIME_CLUSTERER is None:
+        from src.jv2.regime_clusterer import RegimeClusterer
+        _REGIME_CLUSTERER = RegimeClusterer.load()
+    return _REGIME_CLUSTERER
+
+
 class JV2Bot(ABC):
     """Abstrakter JV2 Bot — jeder Spezialist erbt hiervon."""
 
@@ -124,7 +136,7 @@ class JV2Bot(ABC):
         atr = market_data.get("atr_4h", 0.0)
         if r4 is None:
             return {}
-        return {
+        regime = {
             "adx": _safe(r4.get("4h_adx")),
             "rsi": _safe(r4.get("4h_rsi_14"), 50.0),
             "bb_pos": _safe(r4.get("4h_bb_pos"), 0.5),
@@ -134,6 +146,8 @@ class JV2Bot(ABC):
             "trend_consistency": _safe(r4.get("4h_trend_consistency")),
             "fear_greed": _safe(sent.get("fear_greed"), 50.0),
         }
+        regime["cluster"] = _get_clusterer().assign(regime)
+        return regime
 
     # ── RISK CHECK ───────────────────────────────────
 
@@ -234,6 +248,7 @@ class JV2Bot(ABC):
             regime_chop=float(rg.get("chop", 0.0)),
             regime_trend_consistency=float(rg.get("trend_consistency", 0.0)),
             regime_fear_greed=float(rg.get("fear_greed", 0.0)),
+            regime_cluster=int(rg.get("cluster", -1)),
         )
 
         self.state.position = None

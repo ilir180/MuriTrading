@@ -152,6 +152,7 @@ class TradeRecord:
     regime_chop: float = 0.0
     regime_trend_consistency: float = 0.0
     regime_fear_greed: float = 0.0
+    regime_cluster: int = -1
 
     def to_csv_row(self):
         return (f"{self.timestamp},{self.bot_id},{self.direction},"
@@ -161,14 +162,16 @@ class TradeRecord:
                 f"{self.regime_adx:.2f},{self.regime_rsi:.2f},"
                 f"{self.regime_bb_pos:.4f},{self.regime_bbw:.4f},"
                 f"{self.regime_atr_pct:.4f},{self.regime_chop:.4f},"
-                f"{self.regime_trend_consistency:.4f},{self.regime_fear_greed:.1f}")
+                f"{self.regime_trend_consistency:.4f},{self.regime_fear_greed:.1f},"
+                f"{self.regime_cluster}")
 
     @staticmethod
     def csv_header():
         return ("timestamp,bot_id,direction,entry_price,exit_price,size_usd,pnl,"
                 "net_return_pct,reason,hold_candles,bot_capital_after,"
                 "regime_adx,regime_rsi,regime_bb_pos,regime_bbw,"
-                "regime_atr_pct,regime_chop,regime_trend_consistency,regime_fear_greed")
+                "regime_atr_pct,regime_chop,regime_trend_consistency,regime_fear_greed,"
+                "regime_cluster")
 
 
 @dataclass

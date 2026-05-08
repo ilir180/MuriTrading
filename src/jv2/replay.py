@@ -42,9 +42,20 @@ def _safe(val, default=0.0):
     return float(val)
 
 
+_REPLAY_CLUSTERER = None
+
+
+def _get_clusterer():
+    global _REPLAY_CLUSTERER
+    if _REPLAY_CLUSTERER is None:
+        from src.jv2.regime_clusterer import RegimeClusterer
+        _REPLAY_CLUSTERER = RegimeClusterer.load()
+    return _REPLAY_CLUSTERER
+
+
 def _snapshot_regime_from_row(row, atr, price) -> dict:
     """Same shape as base_bot._snapshot_regime, computed from a historical bar."""
-    return {
+    regime = {
         "adx":               _safe(row.get("4h_adx")),
         "rsi":               _safe(row.get("4h_rsi_14"), 50.0),
         "bb_pos":            _safe(row.get("4h_bb_pos"), 0.5),
@@ -54,6 +65,8 @@ def _snapshot_regime_from_row(row, atr, price) -> dict:
         "trend_consistency": _safe(row.get("4h_trend_consistency")),
         "fear_greed":        50.0,  # not available historically
     }
+    regime["cluster"] = _get_clusterer().assign(regime)
+    return regime
 
 
 def _build_market_data(symbol, df_1h, df_4h, df_1d, i):
@@ -169,6 +182,7 @@ def _close_position(bot, exit_price: float, reason: str, exit_time: str) -> Trad
         regime_chop=float(rg.get("chop", 0.0)),
         regime_trend_consistency=float(rg.get("trend_consistency", 0.0)),
         regime_fear_greed=float(rg.get("fear_greed", 0.0)),
+        regime_cluster=int(rg.get("cluster", -1)),
     )
     bot.state.position = None
     return record
