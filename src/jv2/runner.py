@@ -174,6 +174,13 @@ def main():
             now = datetime.now(timezone.utc)
             heartbeat_count += 1
 
+            # Watchdog heartbeat — pro Iteration eine frische mtime hinterlassen.
+            try:
+                with open(HEARTBEAT_FILE, "w") as _hb:
+                    _hb.write(now.isoformat())
+            except Exception:
+                pass
+
             # ── Preise holen für alle Assets ──
             for symbol in SYMBOLS:
                 try:

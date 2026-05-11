@@ -16,6 +16,7 @@ XRP/USDT Paper-Trading-System mit JV Boting v2 Architektur.
 - **Scheduling**: Windows Task Scheduler (ersetzt macOS launchd)
 - **Scripts**: PowerShell (.ps1) — keine .sh Shell-Scripts mehr
 - **Pfade**: Windows-Pfade (`C:\Users\...`), im Python-Code `pathlib.Path` verwenden
+- **Sleep deaktiviert**: `standby-timeout-ac/dc = 0`, `hibernate-timeout-ac/dc = 0`. PC läuft 24/7. Wenn `powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE` etwas anderes als `0x0` zeigt, neu setzen.
 
 ## Aktive Systeme
 
@@ -25,8 +26,16 @@ XRP/USDT Paper-Trading-System mit JV Boting v2 Architektur.
 - **Kein Konsens, kein Voting** — jeder Bot tradet selbstständig
 - Kapital: $1000 total, $125 pro Bot, wöchentliches Performance-Rebalancing
 - Timeframe: 4H Candles, Exit-Check alle 60s
-- Scheduling: Windows Task Scheduler
+- Scheduling: Windows Task Scheduler — Task `MuriTrading-JV2` (Logon-Trigger)
 - Logs: `data/bot/jv2/jv2_output.log`
+- **Heartbeat**: `runner.py` schreibt `data/bot/jv2/heartbeat.txt` jede Iteration
+
+### Watchdog (`scripts/watchdog_jv2.ps1`)
+- Task `MuriTrading-JV2-Watchdog` läuft alle 5 Min und garantiert Self-Healing
+- Restartet JV2 wenn: Task nicht Running ODER kein `runner.py`-Prozess ODER `jv2_output.log` > 15 Min still ODER `heartbeat.txt` > 3 Min alt
+- 3-Min Cold-Start Grace nach Bot-Start (für Imports + Binance-Init)
+- Log: `data/bot/jv2/watchdog.log` (Heartbeat 1×/Stunde, sonst nur bei Restart)
+- **Wenn Bot tot/inaktiv erscheint**: zuerst `watchdog.log` + Task-State checken, dann `LastTaskResult` (Hex). `0xC000013A` = Strg+C/Shutdown.
 
 ### Die 8 Bots
 | Bot | Datei | These |
@@ -56,13 +65,17 @@ XRP/USDT Paper-Trading-System mit JV Boting v2 Architektur.
 - `src/features/cross_asset.py` → `build_cross_asset_features(exchange)` — BTC/ETH Korrelation
 
 ## Wichtige Dateien
-- `src/jv2/config.py` — Alle Konstanten
+- `src/jv2/config.py` — Alle Konstanten (inkl. `HEARTBEAT_FILE`)
 - `src/jv2/models.py` — Datentypen (JV2Signal, BotPosition, BotState, TradeRecord)
 - `src/jv2/base_bot.py` — Abstract Base Bot mit Position-Management
-- `src/jv2/runner.py` — Hauptloop
+- `src/jv2/runner.py` — Hauptloop, schreibt `heartbeat.txt` pro Iteration
+- `scripts/run_jv2.ps1` — Runner-Launcher (vom Task `MuriTrading-JV2` aufgerufen)
+- `scripts/watchdog_jv2.ps1` — Self-Healing-Watchdog (vom Task `MuriTrading-JV2-Watchdog` aufgerufen)
 - `data/bot/jv2/state.json` — Alle Bot-States
 - `data/bot/jv2/trades.csv` — Trade-History
-- `data/bot/jv2/equity.csv` — Equity-Kurven
+- `data/bot/jv2/equity.csv` — Equity-Kurven (wird pro 4H-Kerze geschrieben, NICHT pro Tick)
+- `data/bot/jv2/heartbeat.txt` — Watchdog-Heartbeat (pro Tick, ~60s)
+- `data/bot/jv2/watchdog.log` — Watchdog-Aktivität
 
 ## Technische Hinweise
 - Python 3.11.x via pyenv-win oder conda

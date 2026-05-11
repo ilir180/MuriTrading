@@ -15,6 +15,7 @@ SIGNALS_CSV     = os.path.join(JV2_DIR, "signals.csv")
 SPY_LOG_CSV     = os.path.join(JV2_DIR, "spy_log.csv")
 SCOUT_REPORT    = os.path.join(JV2_DIR, "scout_report.json")
 REPORTS_DIR     = os.path.join(JV2_DIR, "daily_reports")
+HEARTBEAT_FILE  = os.path.join(JV2_DIR, "heartbeat.txt")
 
 # ── Assets ────────────────────────────────────────────
 SYMBOLS = {
