@@ -161,6 +161,7 @@ def main():
     last_4h_slot = None
     last_daily_report = None
     last_rebalance_week = None
+    last_coach_run = None
     heartbeat_count = 0
     spy_intel = {}
     # Cache für Daten zwischen Candles
@@ -382,6 +383,47 @@ def main():
 
                 analyst.generate_daily_report(bots, scout, prices, market_info, eval_results)
                 log(f"Daily Report gesendet", C.BLUE)
+
+            # ── Daily Coach Run (after daily report) ──
+            # Runs once per day. If it fails, the runner does NOT crash —
+            # bots keep operating on the previous coach_state.json.
+            coach_hour = (DAILY_REPORT_HOUR + 1) % 24  # one hour after report
+            if now.hour == coach_hour and last_coach_run != today_key:
+                last_coach_run = today_key
+                try:
+                    from src.jv2.coach import Coach
+                    from collections import defaultdict as _dd
+                    all_ids = [b.bot_id for b in bots]
+                    coach = Coach()
+                    decisions = coach.evaluate(all_bot_ids=all_ids)
+                    coach.write_state(decisions)
+
+                    by_action = _dd(int)
+                    for d in decisions.values():
+                        by_action[d.action] += 1
+                    summary_line = " | ".join(
+                        f"{act}:{n}" for act, n in sorted(by_action.items()) if n)
+                    log(f"\U0001F9E0 Coach: {summary_line}", C.PURPLE)
+                    tg_send(f"\U0001F9E0 <b>Coach update</b>\n{summary_line}")
+
+                    # Reload directives into live bots without restart.
+                    from src.jv2.coach import get_cell_directive, load_coach_state
+                    cs = load_coach_state()
+                    for b in bots:
+                        dr = get_cell_directive(b.bot_id, cs)
+                        b.coach_action = dr["action"]
+                        b.coach_lev_mult = dr["leverage_multiplier"]
+                        b.coach_cap_mult = dr["capital_multiplier"]
+                        b.regime_blacklist = set(dr["regime_blacklist"])
+                        b.regime_whitelist = (set(dr["regime_whitelist"])
+                                              if dr["regime_whitelist"] is not None else None)
+                        b.invert_signal = dr["invert"]
+                        if dr["exec_override"]:
+                            b.risk_profile.update(dr["exec_override"])
+                        b.coach_disabled = (dr["action"] == "disable"
+                                            or dr["capital_multiplier"] == 0.0)
+                except Exception as e:
+                    log(f"Coach failed: {e} — bots continue with previous state", C.YELLOW)
 
             time.sleep(CHECK_INTERVAL)
 

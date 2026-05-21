@@ -47,11 +47,35 @@ class JV2Bot(ABC):
             "sl_atr": SL_ATR_MULT, "tp_atr": TP_ATR_MULT, "max_hold": MAX_HOLD_CANDLES,
         }))
 
-        # Overrides pro Bot×Asset
+        # Manual overrides (legacy baseline)
         override = BOT_OVERRIDES.get(self.bot_id, {})
         self.invert_signal = override.get("invert", False)
         if override.get("exec_override"):
             self.risk_profile.update(override["exec_override"])
+
+        # Coach directives override the manual baseline.
+        # If coach_state.json is missing, we keep the manual baseline as-is.
+        from src.jv2.coach import get_cell_directive
+        directive = get_cell_directive(self.bot_id)
+        self.coach_action = directive["action"]
+        self.coach_lev_mult = directive["leverage_multiplier"]
+        self.coach_cap_mult = directive["capital_multiplier"]
+        self.regime_blacklist = set(directive["regime_blacklist"])
+        self.regime_whitelist = (set(directive["regime_whitelist"])
+                                 if directive["regime_whitelist"] is not None else None)
+        # Coach can overrule manual invert/exec_override
+        self.invert_signal = directive["invert"]
+        if directive["exec_override"]:
+            self.risk_profile.update(directive["exec_override"])
+        # Disabled cells refuse to trade
+        self.coach_disabled = (directive["action"] == "disable"
+                               or directive["capital_multiplier"] == 0.0)
+
+        # Apply leverage multiplier into risk profile (final leverage is float-rounded).
+        base_lev = self.risk_profile.get("leverage", 1)
+        scaled_lev = max(1.0, base_lev * self.coach_lev_mult)
+        # Round to nearest 0.5 so behavior is predictable
+        self.risk_profile["leverage"] = round(scaled_lev * 2) / 2
 
     # ── ABSTRAKT ──────────────────────────────────────
 
@@ -121,8 +145,16 @@ class JV2Bot(ABC):
         if signal.direction != "neutral" and signal.confidence >= MIN_CONFIDENCE:
             if self.state.position is None and self._can_trade():
                 regime = self._snapshot_regime(market_data)
-                entry_info = self._open_position(
-                    signal, market_data["price"], market_data["atr_4h"], regime)
+                # Coach regime gating
+                cluster = regime.get("cluster", -1)
+                if cluster in self.regime_blacklist:
+                    pass  # gated off — no entry
+                elif (self.regime_whitelist is not None
+                      and cluster not in self.regime_whitelist):
+                    pass  # not in whitelist — no entry
+                else:
+                    entry_info = self._open_position(
+                        signal, market_data["price"], market_data["atr_4h"], regime)
 
         return signal, entry_info, thesis_exit
 
@@ -152,6 +184,8 @@ class JV2Bot(ABC):
     # ── RISK CHECK ───────────────────────────────────
 
     def _can_trade(self) -> bool:
+        if self.coach_disabled:
+            return False
         if self.state.capital < MIN_ALLOC:
             return False
         if self.state.cooldown_until:

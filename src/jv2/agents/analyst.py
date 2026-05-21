@@ -116,6 +116,35 @@ class AnalystAgent:
             lines.append("</pre>")
             lines.append("<i>These=Markt richtig gelesen | Exec=Move eingefangen | Edge=besser als Zufall</i>")
 
+        # ── Coach Verdict ──
+        try:
+            from src.jv2.coach import load_coach_state
+            cs = load_coach_state()
+            if cs:
+                decisions = cs.get("decisions", {})
+                from collections import defaultdict as _dd
+                buckets = _dd(list)
+                for bid, d in decisions.items():
+                    buckets[d.get("action", "keep")].append(bid)
+                lines.append(f"\n<b>\U0001F9E0 Coach Verdict</b> "
+                             f"<i>({cs.get('last_update','')[:19]} UTC)</i>:")
+                order = [("champion", "\U0001F451 Champion"),
+                         ("promote", "\U0001F4C8 Promote"),
+                         ("invert", "\U0001F501 Invert"),
+                         ("demote", "\U0001F4C9 Demote"),
+                         ("disable", "⛔ Disable")]
+                for act, label in order:
+                    cells = buckets.get(act, [])
+                    if cells:
+                        lines.append(f"  {label}: {len(cells)} — "
+                                     f"{', '.join(c.replace('_XRP','').replace('_BTC','').replace('_ETH','').replace('_SOL','') + c[-4:] for c in sorted(cells)[:6])}"
+                                     + (" …" if len(cells) > 6 else ""))
+                n_kept = len(buckets.get("keep", []))
+                if n_kept:
+                    lines.append(f"  ➖ Keep: {n_kept}")
+        except Exception:
+            pass
+
         msg = "\n".join(lines)
         tg_send(msg)
 
