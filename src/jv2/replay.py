@@ -282,12 +282,15 @@ def replay_asset(bots: List, symbol: str, df_1h, df_4h, df_1d) -> List[TradeReco
                     trades.append(_close_position(bot, market_data["price"], "TIME-EXIT", bar_time))
                     continue
 
-                # Thesis exit at bar close
-                still_valid, reason = bot.check_thesis(market_data)
-                if not still_valid:
-                    trades.append(_close_position(
-                        bot, market_data["price"], f"THESIS-EXIT: {reason}", bar_time))
-                    continue
+                # Thesis exit at bar close — skipped for inverted bots
+                # (mirrors base_bot fix: original thesis is opposite to inverted
+                # position direction, so check_thesis would always close).
+                if not bot.invert_signal:
+                    still_valid, reason = bot.check_thesis(market_data)
+                    if not still_valid:
+                        trades.append(_close_position(
+                            bot, market_data["price"], f"THESIS-EXIT: {reason}", bar_time))
+                        continue
 
             # 2) generate signal at bar close
             try:

@@ -119,10 +119,16 @@ class JV2Bot(ABC):
             self.state.position.candles_held += 1
 
             # These-Check: Stimmt der Grund für den Trade noch?
-            still_valid, invalidation_reason = self.check_thesis(market_data)
-            if not still_valid:
-                thesis_exit = self._close_position(
-                    market_data["price"], f"THESIS-EXIT: {invalidation_reason}")
+            # Bei invertierten Bots übersprungen: check_thesis() prüft die
+            # Original-These (z.B. "EMA bullish für long"). Eine invertierte
+            # Position basiert auf der Gegen-These und würde sonst sofort wieder
+            # geschlossen, weil die Original-Bedingung per Definition gegen die
+            # Position spricht. Inverted bots verlassen sich auf SL/TP/Trailing/Time.
+            if not self.invert_signal:
+                still_valid, invalidation_reason = self.check_thesis(market_data)
+                if not still_valid:
+                    thesis_exit = self._close_position(
+                        market_data["price"], f"THESIS-EXIT: {invalidation_reason}")
 
         signal = self.generate_signal(market_data, spy_intel)
 
