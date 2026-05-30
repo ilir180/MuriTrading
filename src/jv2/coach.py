@@ -37,6 +37,9 @@ from typing import Dict, List, Optional, Tuple
 from src.jv2.config import (
     TRADES_CSV, SIGNALS_CSV, JV2_DIR, BOT_OVERRIDES,
 )
+from src.jv2.coach_stats import (
+    deflated_sharpe_from_returns, evaluate_cell as evaluate_cell_dsr,
+)
 
 COUNTERFACTUAL_CSV = os.path.join(JV2_DIR, "counterfactual_trades.csv")
 COACH_STATE_FILE   = os.path.join(JV2_DIR, "coach_state.json")
@@ -69,6 +72,15 @@ CF_WEIGHT_RATIO          = 0.3   # blend = 0.7*live + 0.3*cf when both present
 # Hysteresis: an existing action stays unless the new evaluation has at
 # least this confidence. Prevents weekly whiplash (Champion -> Keep -> Champion).
 HYSTERESIS_CONFIDENCE_THRESHOLD = 0.6
+
+# DSR (Deflated Sharpe Ratio) integration. Used as a CONFIDENCE MODULATOR,
+# not a hard gate — with our small N per cell (5-50 trades), absolute DSR
+# is too punitive to use as a veto. Instead:
+#   - Compute DSR per cell using returns (net_return_pct/100)
+#   - Map DSR to a multiplier in [0.5, 1.5] that scales Coach confidence
+#   - Top-quartile DSR cells get confidence boost, bottom-quartile get cut
+# n_trials = number of cells we're effectively testing.
+N_DSR_TRIALS = 32
 
 # Capital multipliers applied at weekly rebalance time.
 CAP_MULT = {
@@ -122,6 +134,8 @@ class CellStats:
     gross_loss: float = 0.0
     by_regime: Dict[int, dict] = field(default_factory=lambda: defaultdict(
         lambda: {"n": 0, "wins": 0, "pnl": 0.0}))
+    # Returns series (net_return_pct/100) used for DSR computation.
+    returns: List[float] = field(default_factory=list)
 
     @property
     def wr(self) -> float:
@@ -151,6 +165,8 @@ class CellDecision:
     confidence: float = 0.0
     evidence: str = ""
     stats: dict = field(default_factory=dict)
+    dsr: Optional[float] = None              # Deflated Sharpe Ratio
+    dsr_multiplier: float = 1.0              # confidence boost/cut from DSR rank
 
 
 # ── Core ───────────────────────────────────────────────────
@@ -173,9 +189,11 @@ def _aggregate(trades: List[dict]) -> Dict[str, CellStats]:
             continue
         pnl = _safe(t.get("pnl"))
         cluster = int(_safe(t.get("regime_cluster"), -1))
+        ret = _safe(t.get("net_return_pct"), 0.0) / 100.0
         s = stats.setdefault(bid, CellStats(bot_id=bid))
         s.n += 1
         s.pnl_sum += pnl
+        s.returns.append(ret)
         if pnl > 0:
             s.wins += 1
             s.gross_win += pnl
@@ -188,6 +206,62 @@ def _aggregate(trades: List[dict]) -> Dict[str, CellStats]:
             if pnl > 0:
                 r["wins"] += 1
     return stats
+
+
+def _compute_cell_dsrs(stats: Dict[str, CellStats]) -> Dict[str, dict]:
+    """Compute DSR for each cell with returns >= 5. Returns dict keyed by bot_id.
+    Each entry also carries 'sharpe' (raw) for fallback ranking when DSRs
+    cluster at zero due to severe multi-testing penalty on small samples."""
+    out = {}
+    for bid, s in stats.items():
+        if len(s.returns) < 5:
+            out[bid] = {"dsr": None, "sharpe": None,
+                        "verdict": "thin_data", "n": len(s.returns)}
+            continue
+        try:
+            info = evaluate_cell_dsr(s.returns, n_trials=N_DSR_TRIALS)
+            out[bid] = info
+        except Exception:
+            out[bid] = {"dsr": None, "sharpe": None,
+                        "verdict": "error", "n": len(s.returns)}
+    return out
+
+
+def _confidence_multiplier_from_ranking(
+    score: Optional[float], all_scores: List[float]
+) -> float:
+    """Top-quartile -> 1.5, bottom-quartile -> 0.5, middle -> 1.0."""
+    if score is None or not all_scores:
+        return 1.0
+    sorted_s = sorted(all_scores)
+    n = len(sorted_s)
+    if n < 4:
+        return 1.0
+    rank = sum(1 for d in sorted_s if d < score) / max(1, n - 1)
+    if rank >= 0.75:
+        return 1.0 + (rank - 0.75) * 2.0   # 1.0 -> 1.5
+    if rank <= 0.25:
+        return 0.5 + rank * 2.0            # 0.5 -> 1.0
+    return 1.0
+
+
+def _dsr_to_confidence_multiplier(dsr: Optional[float],
+                                   all_dsrs: List[float],
+                                   sharpe: Optional[float] = None,
+                                   all_sharpes: Optional[List[float]] = None) -> float:
+    """Map a cell's DSR rank to a confidence multiplier in [0.5, 1.5].
+
+    Fallback: when DSR variance is degenerate (all cells stuck at 0 due to
+    the multi-testing penalty being too harsh for our N), rank on raw Sharpe
+    instead. This preserves discrimination even when absolute DSRs are flat.
+    """
+    if dsr is None or not all_dsrs:
+        return 1.0
+    # Detect degenerate DSR distribution (e.g. all values within 1e-6 of zero)
+    dsr_range = max(all_dsrs) - min(all_dsrs)
+    if dsr_range < 1e-4 and sharpe is not None and all_sharpes:
+        return _confidence_multiplier_from_ranking(sharpe, all_sharpes)
+    return _confidence_multiplier_from_ranking(dsr, all_dsrs)
 
 
 def _blend_wr(live: CellStats, cf: Optional[CellStats]) -> Tuple[float, float, int]:
@@ -460,8 +534,11 @@ class Coach:
         replaces the prior action when the new confidence >= threshold.
         Otherwise the prior action+invert flag is preserved (but freshly-
         computed stats, evidence, and regime_blacklist still flow through).
-        This prevents weekly whiplash like Champion -> Keep -> Champion that
-        we observed live with contrarian_BTC and flow_tracker_SOL.
+
+        DSR: per-cell Deflated Sharpe Ratio is computed and used as a
+        confidence multiplier. Cells in the top DSR quartile get a boost,
+        bottom quartile cells get cut. Final confidence drives downstream
+        Coach action thresholds (e.g. hysteresis).
         """
         live_trades = _load_trades(self.trades_path)
         cf_trades = _load_trades(self.cf_path)
@@ -472,6 +549,14 @@ class Coach:
         if all_bot_ids:
             bot_ids |= set(all_bot_ids)
 
+        # DSR pass over LIVE cells (use live returns only — cf is degraded
+        # for whale/sentiment dependent bots).
+        dsr_info = _compute_cell_dsrs(live_stats)
+        all_dsrs = [info["dsr"] for info in dsr_info.values()
+                    if info.get("dsr") is not None]
+        all_sharpes = [info["sharpe"] for info in dsr_info.values()
+                       if info.get("sharpe") is not None]
+
         prior = load_coach_state() if apply_hysteresis else None
 
         decisions = {}
@@ -479,6 +564,21 @@ class Coach:
             live = live_stats.get(bid, CellStats(bot_id=bid))
             cf = cf_stats.get(bid)
             new_decision = _decide_cell(bid, live, cf)
+
+            # Attach DSR + multiplier, apply to confidence.
+            cell_dsr_info = dsr_info.get(bid, {})
+            dsr_val = cell_dsr_info.get("dsr")
+            sharpe_val = cell_dsr_info.get("sharpe")
+            mult = _dsr_to_confidence_multiplier(
+                dsr_val, all_dsrs, sharpe_val, all_sharpes)
+            new_decision.dsr = dsr_val
+            new_decision.dsr_multiplier = round(mult, 3)
+            new_decision.confidence = round(
+                max(0.0, min(0.99, new_decision.confidence * mult)), 3)
+            if cell_dsr_info.get("verdict"):
+                new_decision.stats["dsr_verdict"] = cell_dsr_info["verdict"]
+                new_decision.stats["sharpe"] = cell_dsr_info.get("sharpe")
+
             if prior is not None:
                 new_decision = _apply_hysteresis(bid, new_decision, prior)
             decisions[bid] = new_decision
@@ -533,6 +633,8 @@ def _decision_to_dict(d: CellDecision) -> dict:
         "regime_blacklist": d.regime_blacklist,
         "regime_whitelist": d.regime_whitelist,
         "confidence": round(d.confidence, 3),
+        "dsr": round(d.dsr, 4) if d.dsr is not None else None,
+        "dsr_multiplier": d.dsr_multiplier,
         "evidence": d.evidence,
         "stats": d.stats,
     }
