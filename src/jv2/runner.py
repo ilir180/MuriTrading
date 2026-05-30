@@ -107,6 +107,28 @@ def fetch_sentiment():
         return {}
 
 
+def fetch_futures_features(symbol: str, price: float):
+    """Funding Rate Z-Score + OI Quadrant from Binance Perp public API."""
+    try:
+        from src.features.futures_features import compute_futures_features
+        return compute_futures_features(symbol, price)
+    except Exception:
+        return {}
+
+
+def fetch_liquidation_features(symbol: str):
+    """Rolling 15-min liquidation stream snapshot for this symbol."""
+    try:
+        from src.features.liquidation_stream import compute_liquidation_features
+        from src.features.futures_features import SPOT_TO_PERP
+        perp = SPOT_TO_PERP.get(symbol)
+        if not perp:
+            return {}
+        return compute_liquidation_features(perp)
+    except Exception:
+        return {}
+
+
 # ── Main ──────────────────────────────────────────────
 
 def main():
@@ -117,6 +139,16 @@ def main():
     analyst = AnalystAgent()
 
     load_state(bots)
+
+    # Start liquidation WebSocket streams (one daemon thread per symbol).
+    # Safe if module/install missing — returns False, continues.
+    try:
+        from src.features.liquidation_stream import start_all as _start_liq
+        n_streams = _start_liq()
+        if n_streams:
+            log(f"Liquidation streams gestartet: {n_streams}", C.GREEN)
+    except Exception as _e:
+        log(f"Liquidation streams nicht verfügbar: {_e}", C.YELLOW)
 
     # Bots nach Symbol gruppieren
     bots_by_symbol = defaultdict(list)
@@ -254,6 +286,10 @@ def main():
                     # Whale Features
                     whale = fetch_whale(sym_cfg["binance_id"])
 
+                    # Crypto-Native Triade: Funding-Z + OI-Quadrant + Liquidations
+                    futures = fetch_futures_features(symbol, price)
+                    liq = fetch_liquidation_features(symbol)
+
                     atr_4h = _safe(df_4h.iloc[-1].get("4h_atr_14"), price * 0.01)
 
                     market_data = {
@@ -267,6 +303,8 @@ def main():
                         "atr_4h": atr_4h,
                         "whale": whale,
                         "sentiment": sentiment,
+                        "futures": futures,        # funding_z, oi_quadrant, ...
+                        "liquidations": liq,       # liq_volume_15m_usd, ...
                         "cross_asset": {},
                     }
                     market_data_cache[symbol] = market_data
