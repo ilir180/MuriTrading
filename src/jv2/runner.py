@@ -204,6 +204,13 @@ def main():
     last_rebalance_week = None
     last_coach_run = None
     heartbeat_count = 0
+
+    # Shadow Challenger state (paper-traded alternative Coach)
+    from src.jv2.challenger import (
+        load_state as _load_chal, save_state as _save_chal,
+        on_signal as _chal_on_signal, on_tick as _chal_on_tick,
+    )
+    challenger_state = _load_chal()
     spy_intel = {}
     # Cache für Daten zwischen Candles
     prices = {}
@@ -256,6 +263,15 @@ def main():
                         f"[{trade.reason}] PnL:${trade.pnl:+.2f}",
                         C.GREEN if trade.pnl > 0 else C.RED)
                     tg_send(fmt_trade_close(trade))
+
+            # Shadow Challenger: paper-position exit check every tick
+            try:
+                chal_closes = _chal_on_tick(challenger_state, prices)
+                if chal_closes and heartbeat_count % 10 == 0:
+                    log(f"\U0001F9EA Challenger: {len(chal_closes)} paper-closes, "
+                        f"PnL ${challenger_state.total_pnl:+.2f}", C.PURPLE)
+            except Exception:
+                pass
 
             # ── Neue 4H-Kerze ──
             current_4h_slot = now.replace(hour=(now.hour // 4) * 4, minute=0, second=0, microsecond=0)
@@ -362,12 +378,31 @@ def main():
                                     f"TP:${pos.take_profit:.4f} Size:${pos.size_usd:.0f}", C.BOLD)
                                 tg_send(f"{sym_emoji} {sym_short} " + fmt_trade_open(bot.base_id, pos))
 
+                            # Shadow Challenger evaluates this signal independently
+                            try:
+                                if signal.direction != "neutral":
+                                    opened = _chal_on_signal(
+                                        challenger_state, bot.bot_id, symbol,
+                                        signal.direction, float(signal.confidence),
+                                        float(market_data["price"]),
+                                        float(market_data["atr_4h"]),
+                                        market_data,
+                                    )
+                                    if opened:
+                                        log(f"      \U0001F9EA Challenger OPEN "
+                                            f"{signal.direction.upper()} "
+                                            f"conf={challenger_state.positions[bot.bot_id]['boosted_confidence']:.2f}",
+                                            C.PURPLE)
+                            except Exception:
+                                pass
+
                         except Exception as e:
                             log(f"    {bot.bot_id} Fehler: {e}", C.RED)
 
                 # State speichern
                 save_state(bots)
                 append_equity(bots, prices)
+                _save_chal(challenger_state)
 
                 # Summary
                 active = sum(1 for b in bots if b.state.position)

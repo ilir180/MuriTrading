@@ -51,23 +51,44 @@ class BreakoutHunter(JV2Bot):
         if not is_compressed:
             return self.neutral(price, f"Keine Kompression (BBW:{bb_width:.3f})")
 
-        # Expansion erkennen (Breakout passiert gerade)
+        # OI Quadrant gives directional bias during compression.
+        # OI rising in a squeeze = positioning building → directional breakout likely.
+        futures = market_data.get("futures", {})
+        oi_quad = int(_safe(futures.get("oi_quadrant", 0)))
+        oi_score = _safe(futures.get("oi_quadrant_score", 0))
+        # Quadrant 1 (OI↑ Price↑) -> bullish bias; Quadrant 2 (OI↑ Price↓) -> bearish bias
+        oi_directional = oi_quad in (1, 2)
+
+        # Expansion erkennen (Breakout passiert gerade): vol_ratio > 1.3 OR
+        # OI is showing build-up at compression (positioning Pre-Breakout).
         is_expanding = vol_ratio > 1.3
+        oi_buildup_signal = oi_directional and vol_ratio > 1.0
 
-        if not is_expanding:
-            return self.neutral(price, f"Squeeze aber kein Volume (Vol:{vol_ratio:.1f}x)")
+        if not is_expanding and not oi_buildup_signal:
+            return self.neutral(
+                price, f"Squeeze aber kein Volume/OI-Signal (Vol:{vol_ratio:.1f}x OI:Q{oi_quad})"
+            )
 
-        # Richtung
+        # Richtung — Priorität: BB-Break > OI-Quadrant > Daily-EMA
         if close > bb_upper:
             direction = "long"
+            dir_reason = "BB-up"
         elif close < bb_lower:
             direction = "short"
+            dir_reason = "BB-dn"
+        elif oi_quad == 1:
+            direction = "long"
+            dir_reason = "OI-Q1"
+        elif oi_quad == 2:
+            direction = "short"
+            dir_reason = "OI-Q2"
         else:
-            # Daily EMA als Richtungsbias
             if r1d is not None and _safe(r1d.get("1d_ema_9_above_21", 0.5)) > 0.5:
                 direction = "long"
+                dir_reason = "1D-EMA"
             elif r1d is not None:
                 direction = "short"
+                dir_reason = "1D-EMA"
             else:
                 return self.neutral(price, "Breakout-Richtung unklar")
 
@@ -76,7 +97,17 @@ class BreakoutHunter(JV2Bot):
         if vol_ratio > 2.0: conf += 0.15
         if bb_width < 0.015: conf += 0.10
         if vol_ratio > 2.5: conf += 0.10
-        if adx < 20: conf += 0.05  # ADX steigt von niedrig = Breakout-Start
+        if adx < 20: conf += 0.05
+        # OI-Quadrant aligned with direction = directional conviction boost
+        if direction == "long" and oi_quad == 1:
+            conf += 0.10
+        elif direction == "short" and oi_quad == 2:
+            conf += 0.10
+        # OI-Quadrant against direction = caution (potential fade)
+        elif direction == "long" and oi_quad == 2:
+            conf *= 0.7
+        elif direction == "short" and oi_quad == 1:
+            conf *= 0.7
 
         conf = min(conf, 1.0)
 
@@ -85,7 +116,9 @@ class BreakoutHunter(JV2Bot):
             timestamp=JV2Signal.neutral("", 0).timestamp,
             direction=direction,
             confidence=round(conf, 3),
-            reasoning=f"BREAKOUT {direction.upper()}: BBW:{bb_width:.3f} Vol:{vol_ratio:.1f}x ADX:{adx:.0f}",
+            reasoning=f"BREAKOUT {direction.upper()}({dir_reason}): BBW:{bb_width:.3f} Vol:{vol_ratio:.1f}x OI:Q{oi_quad} ADX:{adx:.0f}",
             price_at_signal=price,
-            features={"bb_width": bb_width, "bb_squeeze": bb_squeeze, "vol_ratio": vol_ratio, "adx": adx},
+            features={"bb_width": bb_width, "bb_squeeze": bb_squeeze,
+                      "vol_ratio": vol_ratio, "adx": adx,
+                      "oi_quadrant": oi_quad, "oi_quadrant_score": oi_score},
         )

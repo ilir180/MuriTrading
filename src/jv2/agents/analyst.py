@@ -116,6 +116,22 @@ class AnalystAgent:
             lines.append("</pre>")
             lines.append("<i>These=Markt richtig gelesen | Exec=Move eingefangen | Edge=besser als Zufall</i>")
 
+        # ── Shadow Challenger ──
+        try:
+            from src.jv2.challenger import load_state as _load_chal, compare_vs_champion
+            cs = _load_chal()
+            champ_trades = total_trades
+            champ_wins = total_wins
+            comp = compare_vs_champion(cs, total_pnl, champ_trades, champ_wins)
+            lines.append("\n<b>\U0001F9EA Shadow Challenger A/B</b>:")
+            lines.append(f"  Challenger: ${comp['challenger_pnl']:+.2f} "
+                         f"({comp['challenger_trades']} trades, WR {comp['challenger_wr']:.0%})")
+            lines.append(f"  Champion:   ${comp['champion_pnl']:+.2f} "
+                         f"({comp['champion_trades']} trades, WR {comp['champion_wr']:.0%})")
+            lines.append(f"  Delta:      ${comp['delta_pnl']:+.2f} → {comp['verdict']}")
+        except Exception:
+            pass
+
         # ── Coach Verdict ──
         try:
             from src.jv2.coach import load_coach_state

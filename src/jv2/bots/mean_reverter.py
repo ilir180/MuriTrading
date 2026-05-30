@@ -49,10 +49,17 @@ class MeanReverter(JV2Bot):
         adx = _safe(r4.get("4h_adx", 20))
         trend_cons = _safe(r4.get("4h_trend_consistency", 0.5))
 
+        # Liquidation features — capitulation = mechanical mean-rev trigger.
+        liq = market_data.get("liquidations", {})
+        long_capit = bool(liq.get("liq_long_capit_flag", 0))   # longs got liquidated -> mean-rev LONG bias
+        short_capit = bool(liq.get("liq_short_capit_flag", 0)) # shorts got liquidated -> mean-rev SHORT bias
+        liq_imb = _safe(liq.get("liq_imbalance", 0))
+
         direction = "neutral"
         conf = 0.0
+        liq_reasons = []
 
-        # LONG: Überverkauft
+        # LONG: Überverkauft (existing RSI/BB-based trigger)
         if rsi < 35 and bb_pos < 0.20:
             direction = "long"
             conf = 0.25
@@ -61,7 +68,7 @@ class MeanReverter(JV2Bot):
             if ema50_dist < -0.03: conf += 0.10
             if stoch_rsi < 0.15: conf += 0.10
 
-        # SHORT: Überkauft
+        # SHORT: Überkauft (existing RSI/BB-based trigger)
         elif rsi > 65 and bb_pos > 0.80:
             direction = "short"
             conf = 0.25
@@ -69,6 +76,34 @@ class MeanReverter(JV2Bot):
             if bb_pos > 0.95: conf += 0.10
             if ema50_dist > 0.03: conf += 0.10
             if stoch_rsi > 0.85: conf += 0.10
+
+        # LIQUIDATION-CAPITULATION trigger — independent of RSI/BB.
+        # Mechanic: forced liquidations create overshoots that mean-revert.
+        # Only fires if existing trigger is neutral or aligned.
+        if direction == "neutral":
+            if long_capit and liq_imb > 0.5:
+                direction = "long"
+                conf = 0.30
+                liq_reasons.append("LongLiqCapit!")
+            elif short_capit and liq_imb < -0.5:
+                direction = "short"
+                conf = 0.30
+                liq_reasons.append("ShortLiqCapit!")
+        else:
+            # Aligned-direction capitulation: confidence boost
+            if direction == "long" and long_capit:
+                conf += 0.20
+                liq_reasons.append("LongLiqBoost")
+            elif direction == "short" and short_capit:
+                conf += 0.20
+                liq_reasons.append("ShortLiqBoost")
+            # Opposite-direction capitulation: confidence cut (regime shift risk)
+            elif direction == "long" and short_capit:
+                conf *= 0.5
+                liq_reasons.append("ShortLiqWarn")
+            elif direction == "short" and long_capit:
+                conf *= 0.5
+                liq_reasons.append("LongLiqWarn")
 
         if direction == "neutral":
             return self.neutral(price, f"Kein Extrem (RSI:{rsi:.0f} BB:{bb_pos:.2f})")
@@ -84,12 +119,13 @@ class MeanReverter(JV2Bot):
 
         conf = min(conf, 1.0)
 
+        liq_tag = f" [{','.join(liq_reasons)}]" if liq_reasons else ""
         return JV2Signal(
             bot_id=self.bot_id,
             timestamp=JV2Signal.neutral("", 0).timestamp,
             direction=direction,
             confidence=round(conf, 3),
-            reasoning=f"MEAN-REV {direction.upper()}: RSI:{rsi:.0f} BB:{bb_pos:.2f} EMA50d:{ema50_dist:.3f}",
+            reasoning=f"MEAN-REV {direction.upper()}: RSI:{rsi:.0f} BB:{bb_pos:.2f} EMA50d:{ema50_dist:.3f}{liq_tag}",
             price_at_signal=price,
             features={"rsi": rsi, "bb_pos": bb_pos, "ema50_dist": ema50_dist, "stoch_rsi": stoch_rsi},
         )

@@ -12,25 +12,27 @@ class FlowTracker(JV2Bot):
         super().__init__("flow_tracker", symbol)
 
     def check_thesis(self, market_data):
-        """Flow gilt solange Whale-Flow nicht dreht."""
+        """Flow gilt solange Whale-Flow oder CVD-Trend nicht drehen."""
         if not self.state.position:
             return True, ""
         whale = market_data.get("whale", {})
+        cvd = market_data.get("cvd", {})
         imbalance = _safe(whale.get("whale_bid_ask_imbalance", 0.5))
         net_flow = _safe(whale.get("whale_net_flow_normalized", 0))
-        # Long: Flow darf nicht bearish werden
+        cvd_trend = _safe(cvd.get("cvd_trend_sign", 0))
+        # Long: Flow darf nicht bearish werden — OR CVD-Trend muss nicht hart bearish drehen
         if self.state.position.direction == "long":
-            if imbalance < 0.40 and net_flow < -0.3:
-                return False, f"Flow gedreht bearish (Imb:{imbalance:.2f} Flow:{net_flow:.2f})"
-        # Short: Flow darf nicht bullish werden
+            if imbalance < 0.40 and net_flow < -0.3 and cvd_trend < 0:
+                return False, f"Flow+CVD bearish (Imb:{imbalance:.2f} Flow:{net_flow:.2f} CVD:{cvd_trend:+.0f})"
         if self.state.position.direction == "short":
-            if imbalance > 0.60 and net_flow > 0.3:
-                return False, f"Flow gedreht bullish (Imb:{imbalance:.2f} Flow:{net_flow:.2f})"
+            if imbalance > 0.60 and net_flow > 0.3 and cvd_trend > 0:
+                return False, f"Flow+CVD bullish (Imb:{imbalance:.2f} Flow:{net_flow:.2f} CVD:{cvd_trend:+.0f})"
         return True, ""
 
     def generate_signal(self, market_data, spy_intel):
         price = market_data["price"]
         whale = market_data.get("whale", {})
+        cvd = market_data.get("cvd", {})
         r4 = market_data.get("latest_4h")
 
         imbalance = _safe(whale.get("whale_bid_ask_imbalance", 0.5))
@@ -41,43 +43,67 @@ class FlowTracker(JV2Bot):
         vol_ratio = _safe(r4.get("4h_vol_ratio", 1.0)) if r4 is not None else 1.0
         obv_norm = _safe(r4.get("4h_obv_norm", 0)) if r4 is not None else 0.0
 
+        # CVD features — time-series order flow (vs snapshot whale data)
+        cvd_z = _safe(cvd.get("cvd_1h_z", 0))
+        cvd_buy_share = _safe(cvd.get("cvd_buy_share_4h", 0.5))
+        cvd_trend = _safe(cvd.get("cvd_trend_sign", 0))
+        cvd_accel = _safe(cvd.get("cvd_acceleration", 0))
+
         bull = 0.0
         bear = 0.0
         reasons = []
 
-        # Bid/Ask Imbalance
+        # ── PRIMARY: CVD time-series order flow ──
+        # Direct peer-reviewed evidence (VPIN / Easley-Lopez de Prado /
+        # Anastasopoulos-Gradojevic). Stronger weighting than snapshot whale.
+        if cvd_z > 1.0:
+            bull += 0.35
+            reasons.append(f"CVDz:+{cvd_z:.1f}")
+        elif cvd_z < -1.0:
+            bear += 0.35
+            reasons.append(f"CVDz:{cvd_z:.1f}")
+
+        if cvd_buy_share > 0.58:
+            bull += 0.20
+            reasons.append(f"BuyShr:{cvd_buy_share:.0%}")
+        elif cvd_buy_share < 0.42:
+            bear += 0.20
+            reasons.append(f"SellShr:{1-cvd_buy_share:.0%}")
+
+        if cvd_trend > 0 and cvd_accel > 0:
+            bull += 0.15
+            reasons.append("CVDacc+")
+        elif cvd_trend < 0 and cvd_accel < 0:
+            bear += 0.15
+            reasons.append("CVDacc-")
+
+        # ── SECONDARY: Whale snapshot (existing logic, reduced weight) ──
         if imbalance > 0.58:
-            bull += 0.25
+            bull += 0.15
             reasons.append(f"BidDom:{imbalance:.2f}")
         elif imbalance < 0.42:
-            bear += 0.25
+            bear += 0.15
             reasons.append(f"AskDom:{imbalance:.2f}")
 
-        # Net Flow
         if net_flow > 0.2:
-            bull += 0.20
+            bull += 0.10
             reasons.append(f"Flow:+{net_flow:.2f}")
         elif net_flow < -0.2:
-            bear += 0.20
+            bear += 0.10
             reasons.append(f"Flow:{net_flow:.2f}")
 
-        # Depth Ratio
         if depth_1 > 1.3:
-            bull += 0.15
-            reasons.append(f"Depth:{depth_1:.1f}x")
+            bull += 0.10
         elif depth_1 < 0.7:
-            bear += 0.15
-            reasons.append(f"Depth:{depth_1:.1f}x")
+            bear += 0.10
 
-        # Wall Absorption
         if absorption_ask:
-            bull += 0.30
+            bull += 0.20
             reasons.append("AskAbsorbed!")
         if absorption_bid:
-            bear += 0.30
+            bear += 0.20
             reasons.append("BidAbsorbed!")
 
-        # Volume + OBV
         if vol_ratio > 1.5:
             if obv_norm > 0.3:
                 bull += 0.10
