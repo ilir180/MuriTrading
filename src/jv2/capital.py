@@ -1,74 +1,113 @@
 """
 JV Boting v2 – Capital Allocation & Weekly Rebalancing
+
+HRP × Coach overlay:
+  Base weight    = HRP allocation from rolling-60d returns covariance.
+                   This is risk-balanced (inverse variance, correlation-aware).
+  Coach overlay  = capital_multiplier per cell (champion 1.6, promote 1.3,
+                   keep 1.0, demote 0.6, disable 0.0).
+  Final weight   = HRP_base × coach_multiplier, renormalized.
+
+This way HRP gives risk-aware diversification, Coach overlays performance
+intelligence. Both contribute. Disabled cells go to MIN_ALLOC regardless.
 """
 
-from src.jv2.config import INITIAL_ALLOC, MIN_ALLOC, MAX_ALLOC
+import csv
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+from src.jv2.config import INITIAL_ALLOC, MIN_ALLOC, MAX_ALLOC, TRADES_CSV
 from src.jv2.coach import load_coach_state, get_cell_directive
+from src.jv2.hrp import hierarchical_risk_parity
+
+
+HRP_LOOKBACK_DAYS = 60
+
+
+def _load_recent_returns(lookback_days: int = HRP_LOOKBACK_DAYS) -> dict:
+    """Return {bot_id: [net_return_pct/100]} for trades in the lookback window."""
+    out = defaultdict(list)
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+        with open(TRADES_CSV) as f:
+            for row in csv.DictReader(f):
+                if row.get("timestamp", "") < cutoff:
+                    continue
+                bid = row.get("bot_id")
+                if not bid:
+                    continue
+                try:
+                    ret = float(row.get("net_return_pct", 0)) / 100.0
+                except (ValueError, TypeError):
+                    continue
+                out[bid].append(ret)
+    except FileNotFoundError:
+        pass
+    return dict(out)
 
 
 def rebalance(bots):
     """
-    Wöchentliches Rebalancing: Gewinner kriegen mehr, Verlierer weniger.
-    Coach-Multiplikator wird auf den Performance-Score angewandt — promotete
-    Bots bekommen mehr, demoted weniger, disabled gehen auf MIN_ALLOC.
+    Wöchentliches Rebalancing nach HRP × Coach.
     Bots mit offener Position werden übersprungen.
-    Returns dict mit alter/neuer Allokation.
+    Returns dict {bot_id: {"old": float, "new": float, "skipped": bool,
+                            "hrp_weight": float, "coach_mult": float}}.
     """
     total_equity = sum(bot.state.capital for bot in bots)
     coach_state = load_coach_state()
+    returns_by_bot = _load_recent_returns()
 
-    # Performance-Score pro Bot, multipliziert mit Coach-Capital-Multiplier
-    scores = {}
+    # Ensure every active bot is in the returns dict (even empty list);
+    # HRP gives fallback weight to thin-data cells.
+    for b in bots:
+        returns_by_bot.setdefault(b.bot_id, [])
+
+    hrp_weights = hierarchical_risk_parity(returns_by_bot)
+
+    # Coach overlay
+    overlay = {}
     coach_mults = {}
     for bot in bots:
         directive = get_cell_directive(bot.bot_id, coach_state)
-        coach_mult = directive["capital_multiplier"]
-        coach_mults[bot.bot_id] = coach_mult
+        mult = directive["capital_multiplier"]
+        coach_mults[bot.bot_id] = mult
+        base = hrp_weights.get(bot.bot_id, 1.0 / max(1, len(bots)))
+        overlay[bot.bot_id] = base * mult
 
-        n_trades = bot.state.wins + bot.state.losses
-        if n_trades == 0:
-            raw_score = 0.0
-        else:
-            win_rate = bot.state.wins / n_trades
-            pnl_score = bot.state.total_pnl / INITIAL_ALLOC
-            raw_score = 0.6 * pnl_score + 0.4 * (win_rate - 0.5) * 2
-        # Coach-Multiplier wirkt auf positive UND negative Scores symmetrisch:
-        # promote (1.3) zieht den Score nach oben, demote (0.6) nach unten.
-        scores[bot.bot_id] = raw_score * coach_mult + (coach_mult - 1.0) * 0.5
-
-    # Normalisieren
-    min_s = min(scores.values()) if scores else 0
-    max_s = max(scores.values()) if scores else 0
-    rng = max_s - min_s if max_s != min_s else 1.0
-
-    weights = {}
-    for bid, score in scores.items():
-        # Disabled cells (coach_mult == 0) explicitly get the minimum weight,
-        # so they get MIN_ALLOC and effectively park their capital.
-        if coach_mults.get(bid, 1.0) == 0.0:
-            weights[bid] = 0.01
-        else:
-            weights[bid] = 0.5 + (score - min_s) / rng  # 0.5 - 1.5
-
-    total_weight = sum(weights.values())
+    total_overlay = sum(overlay.values())
+    if total_overlay == 0:
+        # Fallback to equal-weight
+        for b in bots:
+            overlay[b.bot_id] = 1.0 / len(bots)
+        total_overlay = 1.0
 
     changes = {}
     for bot in bots:
         old_cap = bot.state.capital
+        hrp_w = hrp_weights.get(bot.bot_id, 0.0)
+        c_mult = coach_mults.get(bot.bot_id, 1.0)
+
         if bot.state.position is not None:
-            changes[bot.bot_id] = {"old": old_cap, "new": old_cap, "skipped": True}
+            changes[bot.bot_id] = {
+                "old": round(old_cap, 2), "new": round(old_cap, 2),
+                "skipped": True, "hrp_weight": round(hrp_w, 4),
+                "coach_mult": c_mult,
+            }
             continue
 
-        target = total_equity * (weights[bot.bot_id] / total_weight)
-        # Disabled cells: floor at MIN_ALLOC, never grow.
-        if coach_mults.get(bot.bot_id, 1.0) == 0.0:
+        target = total_equity * (overlay[bot.bot_id] / total_overlay)
+        if c_mult == 0.0:
             target = MIN_ALLOC
         else:
             target = max(MIN_ALLOC, min(MAX_ALLOC, target))
         bot.state.capital = round(target, 2)
-        changes[bot.bot_id] = {"old": round(old_cap, 2), "new": round(target, 2), "skipped": False}
+        changes[bot.bot_id] = {
+            "old": round(old_cap, 2), "new": round(target, 2),
+            "skipped": False, "hrp_weight": round(hrp_w, 4),
+            "coach_mult": c_mult,
+        }
 
-    # Rundungsfehler korrigieren
+    # Round-off correction
     actual = sum(bot.state.capital for bot in bots)
     diff = total_equity - actual
     if abs(diff) > 0.01:

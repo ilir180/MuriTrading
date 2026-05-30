@@ -224,7 +224,28 @@ class JV2Bot(ABC):
         if sl_pct < 0.001:
             sl_pct = 0.01
         leverage = rp.get("leverage", 1)
-        risk_amount = self.state.capital * rp["risk"]
+
+        # Quarter-Kelly sizing: blend the bot's static risk% with realized edge.
+        # When the bot has enough trade history (n >= 10), use Quarter-Kelly
+        # derived from its actual win-rate + payoff. Otherwise fall back to
+        # the static risk_profile["risk"] (typically 0.02-0.05).
+        n_trades = self.state.wins + self.state.losses
+        if n_trades >= 10 and self.state.wins > 0 and self.state.losses > 0:
+            from src.jv2.hrp import quarter_kelly_fraction
+            wr = self.state.wins / n_trades
+            # Use a rough proxy for avg_win/avg_loss: total_pnl-derived per-side avg
+            # If we haven't tracked them separately, use the SL/TP ratio as proxy.
+            # Most accurate: avg_win=tp_dist/price, avg_loss=sl_dist/price (geometric).
+            avg_win_pct = tp_dist / price
+            avg_loss_pct = sl_dist / price
+            kelly_f = quarter_kelly_fraction(wr, avg_win_pct, avg_loss_pct)
+            # Use max of static and Kelly to avoid under-sizing winners but never
+            # exceed 2× the static risk (safety cap on Kelly-derived sizing).
+            risk_pct = max(rp["risk"], min(rp["risk"] * 2.0, kelly_f))
+        else:
+            risk_pct = rp["risk"]
+
+        risk_amount = self.state.capital * risk_pct
         size_usd = risk_amount / sl_pct
         max_size = self.state.capital * leverage
         size_usd = min(size_usd, max_size)
