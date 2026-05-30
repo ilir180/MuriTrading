@@ -147,6 +147,24 @@ class JV2Bot(ABC):
 
         self.state.last_signal = signal
 
+        # Publish to Insight Bus (additive — does NOT replace trade path).
+        # The Trader (Coach + position manager) still owns trade execution.
+        try:
+            from src.jv2.insight_bus import publish as _bus_publish
+            _bus_publish(
+                bot_id=self.bot_id,
+                asset=self.symbol,
+                direction=signal.direction,
+                confidence=float(signal.confidence),
+                reasoning=signal.reasoning,
+                price=float(market_data.get("price", 0)),
+                regime_cluster=int(_get_clusterer().assign(
+                    self._snapshot_regime(market_data)) if not signal.direction == "neutral" else -1),
+                half_life_candles=int(self.risk_profile.get("max_hold", 18)),
+            )
+        except Exception:
+            pass
+
         entry_info = None
         if signal.direction != "neutral" and signal.confidence >= MIN_CONFIDENCE:
             if self.state.position is None and self._can_trade():
@@ -273,6 +291,13 @@ class JV2Bot(ABC):
     def _close_position(self, exit_price, reason) -> TradeRecord:
         pos = self.state.position
         pnl, raw_ret, net_ret = pos.calc_pnl(exit_price)
+
+        # Link outcome back to the most recent unfilled insight for this bot.
+        try:
+            from src.jv2.insight_bus import link_outcome as _bus_link
+            _bus_link(self.bot_id, float(pnl), int(pos.candles_held), str(reason))
+        except Exception:
+            pass
 
         self.state.capital += pnl
         self.state.total_pnl += pnl

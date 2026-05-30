@@ -129,6 +129,15 @@ def fetch_liquidation_features(symbol: str):
         return {}
 
 
+def fetch_cvd_features(symbol: str):
+    """Cumulative Volume Delta over rolling 1h/4h/24h windows from spot tape."""
+    try:
+        from src.features.cvd_features import cvd_features_for
+        return cvd_features_for(symbol)
+    except Exception:
+        return {}
+
+
 # ── Main ──────────────────────────────────────────────
 
 def main():
@@ -289,6 +298,7 @@ def main():
                     # Crypto-Native Triade: Funding-Z + OI-Quadrant + Liquidations
                     futures = fetch_futures_features(symbol, price)
                     liq = fetch_liquidation_features(symbol)
+                    cvd = fetch_cvd_features(symbol)
 
                     atr_4h = _safe(df_4h.iloc[-1].get("4h_atr_14"), price * 0.01)
 
@@ -305,6 +315,7 @@ def main():
                         "sentiment": sentiment,
                         "futures": futures,        # funding_z, oi_quadrant, ...
                         "liquidations": liq,       # liq_volume_15m_usd, ...
+                        "cvd": cvd,                # cvd_1h_z, buy_share_4h, ...
                         "cross_asset": {},
                     }
                     market_data_cache[symbol] = market_data
