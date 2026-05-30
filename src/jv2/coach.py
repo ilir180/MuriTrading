@@ -55,10 +55,20 @@ WR_PROMOTE_THRESHOLD     = 0.55
 WR_REGIME_BAD_THRESHOLD  = 0.30
 WR_REGIME_GOOD_THRESHOLD = 0.50
 
+# Stricter regime gating for inverted cells: even 3 trades at 0% WR
+# in a cluster is enough to blacklist. Live observation showed inversion
+# fails catastrophically in trending regimes (cluster 0, 3).
+MIN_TRADES_INVERT_REGIME_GATE = 3
+WR_INVERT_REGIME_BAD          = 0.0001  # i.e. 0 wins
+
 PF_PROMOTE_THRESHOLD     = 1.20  # profit factor
 
 # Counterfactual is supporting evidence, not primary. Weight ratio:
 CF_WEIGHT_RATIO          = 0.3   # blend = 0.7*live + 0.3*cf when both present
+
+# Hysteresis: an existing action stays unless the new evaluation has at
+# least this confidence. Prevents weekly whiplash (Champion -> Keep -> Champion).
+HYSTERESIS_CONFIDENCE_THRESHOLD = 0.6
 
 # Capital multipliers applied at weekly rebalance time.
 CAP_MULT = {
@@ -245,7 +255,7 @@ def _decide_cell(bot_id: str, live: CellStats, cf: Optional[CellStats]) -> CellD
         # Performance is bad under CURRENT config -> flip whatever it is now.
         new_invert = not currently_inverted
         verb = "flip ON inversion" if new_invert else "flip OFF inversion"
-        return CellDecision(
+        decision = CellDecision(
             bot_id=bot_id, action="invert", invert=new_invert,
             capital_multiplier=CAP_MULT["invert"], leverage_multiplier=LEV_MULT["invert"],
             confidence=min(0.9, (WR_INVERT_THRESHOLD - blended_wr) * 3 + 0.3),
@@ -257,6 +267,8 @@ def _decide_cell(bot_id: str, live: CellStats, cf: Optional[CellStats]) -> CellD
                    "avg_pnl": round(blended_avg_pnl, 3),
                    "was_inverted": currently_inverted},
         )
+        _maybe_regime_gate(decision, live)
+        return decision
 
     # ── DISABLE: catastrophic bleeder with lots of LIVE data ──
     # Never disable based on counterfactual alone — features differ.
@@ -281,7 +293,7 @@ def _decide_cell(bot_id: str, live: CellStats, cf: Optional[CellStats]) -> CellD
     if (n_total >= MIN_TRADES_ANY_DECISION
             and blended_wr < WR_DEMOTE_THRESHOLD
             and blended_avg_pnl < 0):
-        return CellDecision(
+        decision = CellDecision(
             bot_id=bot_id, action="demote",
             capital_multiplier=CAP_MULT["demote"],
             leverage_multiplier=LEV_MULT["demote"],
@@ -293,6 +305,8 @@ def _decide_cell(bot_id: str, live: CellStats, cf: Optional[CellStats]) -> CellD
                    "avg_pnl": round(blended_avg_pnl, 3),
                    "was_inverted": currently_inverted},
         )
+        _maybe_regime_gate(decision, live)
+        return decision
 
     # ── CHAMPION: top tier — winning hard, max leverage ──
     if (n_live >= 7 and live.wr >= WR_CHAMPION_THRESHOLD
@@ -348,25 +362,82 @@ def _decide_cell(bot_id: str, live: CellStats, cf: Optional[CellStats]) -> CellD
 
 
 def _maybe_regime_gate(decision: CellDecision, live: CellStats):
-    """Look at per-regime live stats; gate regimes that are clearly bad."""
+    """Look at per-regime live stats; gate regimes that are clearly bad.
+
+    For inverted cells (or cells whose decision is to invert), use the stricter
+    invert-specific thresholds: N>=3 with 0 wins is already a hard gate. This
+    reflects live observation that inversion fails catastrophically in trend
+    regimes — we want to gate those off after very few losses, not wait for a
+    statistically clean sample.
+    """
+    is_inverted = decision.invert
+    min_n_gate = MIN_TRADES_INVERT_REGIME_GATE if is_inverted else MIN_TRADES_REGIME_GATE
+    wr_bad_threshold = (WR_INVERT_REGIME_BAD if is_inverted
+                        else WR_REGIME_BAD_THRESHOLD)
+
     blacklist = []
     whitelist_candidates = []
     regime_summary = {}
     for cid, r in live.by_regime.items():
-        if r["n"] < MIN_TRADES_REGIME_GATE:
+        if r["n"] < min_n_gate:
             continue
         wr = r["wins"] / r["n"]
         avg = r["pnl"] / r["n"]
         regime_summary[cid] = {"n": r["n"], "wr": round(wr, 3), "avg_pnl": round(avg, 3)}
-        if wr < WR_REGIME_BAD_THRESHOLD and avg < 0:
+        if wr <= wr_bad_threshold and avg < 0:
             blacklist.append(cid)
         elif wr >= WR_REGIME_GOOD_THRESHOLD:
             whitelist_candidates.append(cid)
     if blacklist:
         decision.regime_blacklist = sorted(blacklist)
-        decision.evidence += f"; gate-off regimes {blacklist}"
+        gate_tag = "INV-gate" if is_inverted else "gate"
+        decision.evidence += f"; {gate_tag}-off regimes {blacklist}"
     if regime_summary:
         decision.stats["by_regime"] = regime_summary
+
+
+def _apply_hysteresis(bot_id: str, new: CellDecision, prior_state: dict) -> CellDecision:
+    """If a prior decision exists for this cell and the new decision changes the
+    action with insufficient confidence, keep the prior action+invert flag but
+    let everything else (stats, evidence, regime_blacklist) refresh.
+
+    Always allow:
+      - Disable (catastrophic, never delay)
+      - Champion -> any (champion is the highest tier; if data no longer
+        supports it, we want to drop fast)
+      - Any -> any if new confidence >= HYSTERESIS_CONFIDENCE_THRESHOLD
+    """
+    prior_d = prior_state.get("decisions", {}).get(bot_id)
+    if not prior_d:
+        return new
+
+    prior_action = prior_d.get("action", "keep")
+    if prior_action == new.action:
+        return new  # no action change, nothing to hold back
+    if new.action == "disable":
+        return new
+    if prior_action == "champion":
+        return new  # always allow champion downgrade
+    if new.confidence >= HYSTERESIS_CONFIDENCE_THRESHOLD:
+        return new
+
+    # Hold previous action; carry fresh evidence/stats forward.
+    held = CellDecision(
+        bot_id=bot_id,
+        action=prior_action,
+        capital_multiplier=CAP_MULT.get(prior_action, 1.0),
+        leverage_multiplier=LEV_MULT.get(prior_action, 1.0),
+        invert=bool(prior_d.get("invert", False)),
+        exec_override=prior_d.get("exec_override"),
+        regime_blacklist=new.regime_blacklist,  # use fresh regime data
+        regime_whitelist=new.regime_whitelist,
+        confidence=new.confidence,
+        evidence=(f"[HYSTERESIS held={prior_action}, new={new.action} "
+                  f"conf={new.confidence:.2f} < {HYSTERESIS_CONFIDENCE_THRESHOLD}] "
+                  + new.evidence),
+        stats=new.stats,
+    )
+    return held
 
 
 class Coach:
@@ -380,9 +451,18 @@ class Coach:
         self.cf_path = counterfactual_path
         self.signals_path = signals_path
 
-    def evaluate(self, all_bot_ids: Optional[List[str]] = None) -> Dict[str, CellDecision]:
+    def evaluate(self, all_bot_ids: Optional[List[str]] = None,
+                 apply_hysteresis: bool = True) -> Dict[str, CellDecision]:
         """Returns {bot_id: CellDecision}. If all_bot_ids given, ensures every
-        cell has an entry (default keep) even with zero trades."""
+        cell has an entry (default keep) even with zero trades.
+
+        Hysteresis: if a prior coach_state.json exists, a new action only
+        replaces the prior action when the new confidence >= threshold.
+        Otherwise the prior action+invert flag is preserved (but freshly-
+        computed stats, evidence, and regime_blacklist still flow through).
+        This prevents weekly whiplash like Champion -> Keep -> Champion that
+        we observed live with contrarian_BTC and flow_tracker_SOL.
+        """
         live_trades = _load_trades(self.trades_path)
         cf_trades = _load_trades(self.cf_path)
         live_stats = _aggregate(live_trades)
@@ -392,11 +472,16 @@ class Coach:
         if all_bot_ids:
             bot_ids |= set(all_bot_ids)
 
+        prior = load_coach_state() if apply_hysteresis else None
+
         decisions = {}
         for bid in sorted(bot_ids):
             live = live_stats.get(bid, CellStats(bot_id=bid))
             cf = cf_stats.get(bid)
-            decisions[bid] = _decide_cell(bid, live, cf)
+            new_decision = _decide_cell(bid, live, cf)
+            if prior is not None:
+                new_decision = _apply_hysteresis(bid, new_decision, prior)
+            decisions[bid] = new_decision
         return decisions
 
     def write_state(self, decisions: Dict[str, CellDecision],
@@ -412,7 +497,9 @@ class Coach:
                 "wr_regime_bad": WR_REGIME_BAD_THRESHOLD,
                 "min_trades_invert_live": MIN_TRADES_INVERT_LIVE,
                 "min_trades_invert_total": MIN_TRADES_INVERT_TOTAL,
+                "min_trades_invert_regime_gate": MIN_TRADES_INVERT_REGIME_GATE,
                 "cf_weight_ratio": CF_WEIGHT_RATIO,
+                "hysteresis_confidence": HYSTERESIS_CONFIDENCE_THRESHOLD,
             },
             "decisions": {bid: _decision_to_dict(d) for bid, d in decisions.items()},
         }
