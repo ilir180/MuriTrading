@@ -149,6 +149,28 @@ def main():
 
     load_state(bots)
 
+    # Write an initial heartbeat ASAP so the watchdog doesn't kill us during
+    # cold-start (CVD bootstrap can take ~70s across 4 symbols).
+    try:
+        with open(HEARTBEAT_FILE, "w") as _hb:
+            _hb.write(datetime.now(timezone.utc).isoformat())
+    except Exception:
+        pass
+
+    # Start a background heartbeat thread so the watchdog stays happy even
+    # during long blocking operations (CVD bootstrap, 4H candle processing,
+    # multi-symbol HTTP calls). Daemon: dies with the main process.
+    import threading as _th
+    def _heartbeat_thread():
+        while True:
+            try:
+                with open(HEARTBEAT_FILE, "w") as _hb:
+                    _hb.write(datetime.now(timezone.utc).isoformat())
+            except Exception:
+                pass
+            time.sleep(45)
+    _th.Thread(target=_heartbeat_thread, daemon=True, name="hb_writer").start()
+
     # Start liquidation WebSocket streams (one daemon thread per symbol).
     # Safe if module/install missing — returns False, continues.
     try:
@@ -251,18 +273,27 @@ def main():
                 log(f"#{heartbeat_count}  {price_str}  Active:{active}  PnL:${total_pnl:+.1f}", C.DIM)
 
             # ── Alle Bots: Exit-Check (60s) ──
+            had_close = False
             for bot in bots:
                 price = prices.get(bot.symbol, 0)
                 if price <= 0:
                     continue
                 trade = bot.tick(price)
                 if trade:
+                    had_close = True
                     append_trade(trade)
                     sym_short = SYMBOLS.get(bot.symbol, {}).get("short", "?")
                     log(f"\u274C CLOSE {bot.bot_id} [{sym_short}] {trade.direction.upper()} "
                         f"[{trade.reason}] PnL:${trade.pnl:+.2f}",
                         C.GREEN if trade.pnl > 0 else C.RED)
                     tg_send(fmt_trade_close(trade))
+            # Persist state immediately on any close — protects against
+            # phantom re-closes if process dies mid-cycle before 4H save.
+            if had_close:
+                try:
+                    save_state(bots)
+                except Exception:
+                    pass
 
             # Shadow Challenger: paper-position exit check every tick
             try:

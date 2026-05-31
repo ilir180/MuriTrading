@@ -10,8 +10,8 @@ $LogFile          = Join-Path $DataDir 'jv2_output.log'
 $HeartbeatFile    = Join-Path $DataDir 'heartbeat.txt'    # vom runner.py pro Iteration getoucht (~60s)
 $WatchdogLog      = Join-Path $DataDir 'watchdog.log'
 $LogStaleMin      = 15   # log darf bei wenig Aktivität (zwischen 4H-Kerzen) länger still sein
-$HeartbeatStaleMin = 3   # heartbeat.txt muss jede ~60s frisch sein → 3 Min = großzügiger Slack
-$BootGraceMin     = 3    # Bot darf nach Start 3 Min ohne Heartbeat brauchen (Cold Start, Imports, Binance-Init)
+$HeartbeatStaleMin = 8   # heartbeat.txt: ~60s pro tick, aber 4H-Block + CVD-bootstrap kann 90s+ dauern
+$BootGraceMin     = 8    # Bot darf nach Start 8 Min ohne Heartbeat brauchen (CVD-Bootstrap pro Symbol ~17s × 4 + Init)
 
 function Write-WdLog([string]$msg) {
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
