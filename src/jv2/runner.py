@@ -227,12 +227,17 @@ def main():
     last_coach_run = None
     heartbeat_count = 0
 
-    # Shadow Challenger state (paper-traded alternative Coach)
+    # Shadow Challenger state (paper-traded alternative Coach).
+    # v1 = original boost (additive) — empirically anti-edge.
+    # v2 = inverted boost (flip direction when crowd aligns with bot).
     from src.jv2.challenger import (
         load_state as _load_chal, save_state as _save_chal,
         on_signal as _chal_on_signal, on_tick as _chal_on_tick,
+        load_state_v2 as _load_chal_v2, save_state_v2 as _save_chal_v2,
+        on_signal_v2 as _chal_v2_on_signal, on_tick_v2 as _chal_v2_on_tick,
     )
     challenger_state = _load_chal()
+    challenger_v2_state = _load_chal_v2()
     spy_intel = {}
     # Cache für Daten zwischen Candles
     prices = {}
@@ -298,9 +303,12 @@ def main():
             # Shadow Challenger: paper-position exit check every tick
             try:
                 chal_closes = _chal_on_tick(challenger_state, prices)
-                if chal_closes and heartbeat_count % 10 == 0:
-                    log(f"\U0001F9EA Challenger: {len(chal_closes)} paper-closes, "
-                        f"PnL ${challenger_state.total_pnl:+.2f}", C.PURPLE)
+                chal_v2_closes = _chal_v2_on_tick(challenger_v2_state, prices)
+                if (chal_closes or chal_v2_closes) and heartbeat_count % 10 == 0:
+                    log(f"\U0001F9EA v1: {len(chal_closes)} closes "
+                        f"PnL ${challenger_state.total_pnl:+.2f} | "
+                        f"v2: {len(chal_v2_closes)} closes "
+                        f"PnL ${challenger_v2_state.total_pnl:+.2f}", C.PURPLE)
             except Exception:
                 pass
 
@@ -409,20 +417,34 @@ def main():
                                     f"TP:${pos.take_profit:.4f} Size:${pos.size_usd:.0f}", C.BOLD)
                                 tg_send(f"{sym_emoji} {sym_short} " + fmt_trade_open(bot.base_id, pos))
 
-                            # Shadow Challenger evaluates this signal independently
+                            # Shadow Challengers (v1 + v2) evaluate independently
                             try:
                                 if signal.direction != "neutral":
-                                    opened = _chal_on_signal(
+                                    v1_opened = _chal_on_signal(
                                         challenger_state, bot.bot_id, symbol,
                                         signal.direction, float(signal.confidence),
                                         float(market_data["price"]),
                                         float(market_data["atr_4h"]),
                                         market_data,
                                     )
-                                    if opened:
-                                        log(f"      \U0001F9EA Challenger OPEN "
+                                    if v1_opened:
+                                        log(f"      \U0001F9EA v1 OPEN "
                                             f"{signal.direction.upper()} "
                                             f"conf={challenger_state.positions[bot.bot_id]['boosted_confidence']:.2f}",
+                                            C.PURPLE)
+                                    v2_opened = _chal_v2_on_signal(
+                                        challenger_v2_state, bot.bot_id, symbol,
+                                        signal.direction, float(signal.confidence),
+                                        float(market_data["price"]),
+                                        float(market_data["atr_4h"]),
+                                        market_data,
+                                    )
+                                    if v2_opened:
+                                        v2pos = challenger_v2_state.positions[bot.bot_id]
+                                        log(f"      \U0001F9EA v2 OPEN "
+                                            f"{v2pos['direction'].upper()} "
+                                            f"[{v2pos.get('v2_mode','?')}] "
+                                            f"conf={v2pos['boosted_confidence']:.2f}",
                                             C.PURPLE)
                             except Exception:
                                 pass
@@ -434,6 +456,7 @@ def main():
                 save_state(bots)
                 append_equity(bots, prices)
                 _save_chal(challenger_state)
+                _save_chal_v2(challenger_v2_state)
 
                 # Summary
                 active = sum(1 for b in bots if b.state.position)

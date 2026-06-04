@@ -39,6 +39,14 @@ from src.jv2.config import JV2_DIR, MIN_CONFIDENCE, ROUND_TRIP
 CHALLENGER_STATE = os.path.join(JV2_DIR, "challenger_state.json")
 CHALLENGER_TRADES = os.path.join(JV2_DIR, "challenger_trades.csv")
 
+# v2: inverted-boost variant. Same SL/TP/sizing, only the boost interpretation differs.
+CHALLENGER_V2_STATE = os.path.join(JV2_DIR, "challenger_v2_state.json")
+CHALLENGER_V2_TRADES = os.path.join(JV2_DIR, "challenger_v2_trades.csv")
+
+# v2 thresholds for the inverted-boost rule
+V2_BOOST_FLIP_THRESHOLD = 0.10    # boost > this -> flip direction (crowd aligned with bot -> bet against)
+V2_BOOST_CONTRARIAN_THRESHOLD = -0.10  # boost < this -> take bot direction with magnitude as conf bonus
+
 CHALLENGER_INITIAL_CAPITAL = 4000.0  # mirrors Champion
 CHALLENGER_RISK_PER_TRADE = 0.02
 CHALLENGER_LEVERAGE = 1.0            # un-leveraged for clean A/B
@@ -76,14 +84,17 @@ class ChallengerState:
 
 # ── Persistence ──
 
-def load_state() -> ChallengerState:
-    if not os.path.exists(CHALLENGER_STATE):
-        return ChallengerState()
+def load_state(path: str = CHALLENGER_STATE,
+               default_version: str = "challenger-1.0") -> ChallengerState:
+    if not os.path.exists(path):
+        s = ChallengerState()
+        s.version = default_version
+        return s
     try:
-        with open(CHALLENGER_STATE) as f:
+        with open(path) as f:
             data = json.load(f)
         s = ChallengerState()
-        s.version = data.get("version", "challenger-1.0")
+        s.version = data.get("version", default_version)
         s.last_update = data.get("last_update", "")
         s.capital = float(data.get("capital", CHALLENGER_INITIAL_CAPITAL))
         s.total_pnl = float(data.get("total_pnl", 0.0))
@@ -96,7 +107,7 @@ def load_state() -> ChallengerState:
         return ChallengerState()
 
 
-def save_state(state: ChallengerState):
+def save_state(state: ChallengerState, path: str = CHALLENGER_STATE):
     state.last_update = datetime.now(timezone.utc).isoformat()
     payload = {
         "version": state.version,
@@ -108,25 +119,34 @@ def save_state(state: ChallengerState):
         "trades_taken": state.trades_taken,
         "positions": state.positions,
     }
-    tmp = CHALLENGER_STATE + ".tmp"
+    tmp = path + ".tmp"
     try:
         with open(tmp, "w") as f:
             json.dump(payload, f, indent=2)
-        os.replace(tmp, CHALLENGER_STATE)
+        os.replace(tmp, path)
     except Exception:
         pass
 
 
-def _append_trade(row: dict):
+def _append_trade(row: dict, path: str = CHALLENGER_TRADES):
     """Append-only CSV. Header is written on first call."""
-    write_header = not os.path.exists(CHALLENGER_TRADES)
+    write_header = not os.path.exists(path)
     try:
-        with open(CHALLENGER_TRADES, "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:
             if write_header:
                 f.write(",".join(row.keys()) + "\n")
             f.write(",".join(str(v) for v in row.values()) + "\n")
     except Exception:
         pass
+
+
+# v2 wrappers
+def load_state_v2() -> ChallengerState:
+    return load_state(CHALLENGER_V2_STATE, default_version="challenger-2.0")
+
+
+def save_state_v2(state: ChallengerState):
+    save_state(state, CHALLENGER_V2_STATE)
 
 
 # ── Boost logic ──
@@ -152,6 +172,43 @@ def boosted_confidence(base_confidence: float, direction: str,
         boost -= 0.10
     out = base_confidence + boost
     return max(0.0, min(1.0, out))
+
+
+def raw_boost(direction: str, funding_z: float, cvd_z: float) -> float:
+    """The boost value alone, not added to base confidence. Used by v2 logic."""
+    sign = 1 if direction == "long" else -1
+    boost = 0.0
+    if sign * funding_z > 1.0:
+        boost += 0.10
+    elif sign * funding_z < -1.0:
+        boost -= 0.10
+    if sign * cvd_z > 1.0:
+        boost += 0.10
+    elif sign * cvd_z < -1.0:
+        boost -= 0.10
+    return boost
+
+
+def v2_decision(base_direction: str, base_confidence: float,
+                funding_z: float, cvd_z: float):
+    """Returns (direction, effective_confidence, mode) or (None, 0, 'skip').
+
+    Three branches:
+      - boost > +0.10  : crowd CONFIRMS bot signal -> FLIP direction
+                         (anti-crowd bet, conf += boost magnitude)
+      - boost < -0.10  : crowd OPPOSES bot signal -> bot is contrarian, take
+                         original direction with conf += |boost|
+      - else           : signal too weak in boost dimension -> skip
+    """
+    boost = raw_boost(base_direction, funding_z, cvd_z)
+    if boost > V2_BOOST_FLIP_THRESHOLD:
+        flipped = "short" if base_direction == "long" else "long"
+        conf = max(0.0, min(1.0, base_confidence + abs(boost)))
+        return flipped, conf, "flip"
+    if boost < V2_BOOST_CONTRARIAN_THRESHOLD:
+        conf = max(0.0, min(1.0, base_confidence + abs(boost)))
+        return base_direction, conf, "contrarian_confirm"
+    return None, 0.0, "skip"
 
 
 # ── Trade lifecycle ──
@@ -206,7 +263,8 @@ def on_signal(state: ChallengerState, bot_id: str, asset: str,
     return True
 
 
-def on_tick(state: ChallengerState, asset_prices: Dict[str, float]) -> List[dict]:
+def on_tick(state: ChallengerState, asset_prices: Dict[str, float],
+            trades_path: str = CHALLENGER_TRADES) -> List[dict]:
     """Check SL/TP for all open paper positions. Returns list of closed trades."""
     closed = []
     for bot_id, pos in list(state.positions.items()):
@@ -265,9 +323,69 @@ def on_tick(state: ChallengerState, asset_prices: Dict[str, float]) -> List[dict
                 "funding_z": pos["funding_z"],
                 "cvd_z": pos["cvd_z"],
             })
-            _append_trade(closed[-1])
+            _append_trade(closed[-1], path=trades_path)
             del state.positions[bot_id]
     return closed
+
+
+def on_tick_v2(state: ChallengerState, asset_prices: Dict[str, float]) -> List[dict]:
+    """v2 wrapper that writes to challenger_v2_trades.csv."""
+    return on_tick(state, asset_prices, trades_path=CHALLENGER_V2_TRADES)
+
+
+def on_signal_v2(state: ChallengerState, bot_id: str, asset: str,
+                 direction: str, base_confidence: float,
+                 price: float, atr: float, market_data: dict) -> bool:
+    """Inverted-boost variant. Direction is FLIPPED when crowd aligns with bot
+    (boost > +0.10). When crowd opposes bot (boost < -0.10), bot is contrarian
+    and we take the same direction with boost magnitude added to confidence.
+    Other cases: skip the signal entirely (no trade)."""
+    if direction == "neutral":
+        return False
+    if bot_id in state.positions:
+        return False
+
+    futures = market_data.get("futures", {}) or {}
+    cvd = market_data.get("cvd", {}) or {}
+    funding_z = float(futures.get("funding_z", 0.0))
+    cvd_z = float(cvd.get("cvd_1h_z", 0.0))
+
+    v2_dir, v2_conf, mode = v2_decision(direction, base_confidence, funding_z, cvd_z)
+    if v2_dir is None or v2_conf < MIN_CONFIDENCE:
+        return False
+
+    sl_dist = SL_ATR_MULT * atr
+    tp_dist = TP_ATR_MULT * atr
+    if v2_dir == "long":
+        sl = price - sl_dist
+        tp = price + tp_dist
+    else:
+        sl = price + sl_dist
+        tp = price - tp_dist
+    sl_pct = abs(price - sl) / price
+    if sl_pct < 0.001:
+        sl_pct = 0.01
+    risk_amount = state.capital * CHALLENGER_RISK_PER_TRADE
+    size_usd = risk_amount / sl_pct
+    size_usd = min(size_usd, state.capital * CHALLENGER_LEVERAGE)
+    if size_usd < 5.0:
+        return False
+
+    pos = ChallengerPosition(
+        bot_id=bot_id, direction=v2_dir, entry_price=price,
+        size_usd=round(size_usd, 2), sl=round(sl, 6), tp=round(tp, 6),
+        atr=atr, entry_time=datetime.now(timezone.utc).isoformat(),
+        base_confidence=base_confidence,
+        boosted_confidence=v2_conf,
+        funding_z=funding_z, cvd_z=cvd_z,
+    )
+    # Stash v2 mode in the dict for later analysis
+    d = pos.__dict__.copy()
+    d["v2_mode"] = mode
+    d["v2_base_direction"] = direction
+    state.positions[bot_id] = d
+    state.trades_taken += 1
+    return True
 
 
 # ── Comparison ──

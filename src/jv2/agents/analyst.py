@@ -116,19 +116,25 @@ class AnalystAgent:
             lines.append("</pre>")
             lines.append("<i>These=Markt richtig gelesen | Exec=Move eingefangen | Edge=besser als Zufall</i>")
 
-        # ── Shadow Challenger ──
+        # ── Shadow Challenger 3-way A/B (Champion / v1 / v2) ──
         try:
-            from src.jv2.challenger import load_state as _load_chal, compare_vs_champion
-            cs = _load_chal()
-            champ_trades = total_trades
-            champ_wins = total_wins
-            comp = compare_vs_champion(cs, total_pnl, champ_trades, champ_wins)
-            lines.append("\n<b>\U0001F9EA Shadow Challenger A/B</b>:")
-            lines.append(f"  Challenger: ${comp['challenger_pnl']:+.2f} "
-                         f"({comp['challenger_trades']} trades, WR {comp['challenger_wr']:.0%})")
-            lines.append(f"  Champion:   ${comp['champion_pnl']:+.2f} "
-                         f"({comp['champion_trades']} trades, WR {comp['champion_wr']:.0%})")
-            lines.append(f"  Delta:      ${comp['delta_pnl']:+.2f} → {comp['verdict']}")
+            from src.jv2.challenger import load_state, load_state_v2
+            v1 = load_state()
+            v2 = load_state_v2()
+            v1n = v1.wins + v1.losses
+            v1wr = v1.wins / v1n if v1n > 0 else 0.0
+            v2n = v2.wins + v2.losses
+            v2wr = v2.wins / v2n if v2n > 0 else 0.0
+            cwr = total_wins / total_trades if total_trades > 0 else 0.0
+            lines.append("\n<b>\U0001F9EA Shadow Challenger 3-way A/B</b>:")
+            lines.append(f"  Champion: ${total_pnl:+.2f} "
+                         f"({total_trades} trades, WR {cwr:.0%})")
+            lines.append(f"  v1 boost: ${v1.total_pnl:+.2f} "
+                         f"({v1n} closed/{v1.trades_taken} taken, WR {v1wr:.0%}) "
+                         f"Δ ${v1.total_pnl - total_pnl:+.2f}")
+            lines.append(f"  v2 inv:   ${v2.total_pnl:+.2f} "
+                         f"({v2n} closed/{v2.trades_taken} taken, WR {v2wr:.0%}) "
+                         f"Δ ${v2.total_pnl - total_pnl:+.2f}")
         except Exception:
             pass
 
