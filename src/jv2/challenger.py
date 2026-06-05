@@ -43,9 +43,12 @@ CHALLENGER_TRADES = os.path.join(JV2_DIR, "challenger_trades.csv")
 CHALLENGER_V2_STATE = os.path.join(JV2_DIR, "challenger_v2_state.json")
 CHALLENGER_V2_TRADES = os.path.join(JV2_DIR, "challenger_v2_trades.csv")
 
-# v2 thresholds for the inverted-boost rule
-V2_BOOST_FLIP_THRESHOLD = 0.10    # boost > this -> flip direction (crowd aligned with bot -> bet against)
-V2_BOOST_CONTRARIAN_THRESHOLD = -0.10  # boost < this -> take bot direction with magnitude as conf bonus
+# v2 thresholds for the inverted-boost rule.
+# v1: 0.10/-0.10 (strict) required BOTH indicators to align — too rare in
+# practice (0 trades over 24h after deploy). v2: 0.05/-0.05 means already
+# one aligned indicator triggers, which generates a meaningful sample.
+V2_BOOST_FLIP_THRESHOLD = 0.05    # boost > this -> flip direction (crowd aligned with bot -> bet against)
+V2_BOOST_CONTRARIAN_THRESHOLD = -0.05  # boost < this -> take bot direction with magnitude as conf bonus
 
 CHALLENGER_INITIAL_CAPITAL = 4000.0  # mirrors Champion
 CHALLENGER_RISK_PER_TRADE = 0.02

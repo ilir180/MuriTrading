@@ -24,9 +24,13 @@ Auto-reconnect with exponential backoff. Daemon thread (won't block shutdown).
 
 import json
 import math
+import os
+import socket
 import time
 import threading
+import traceback
 from collections import deque
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 try:
@@ -34,6 +38,36 @@ try:
     HAVE_WS = True
 except ImportError:
     HAVE_WS = False
+
+
+# Network-event log: every reconnect / exception in WS daemons goes here
+# so a wifi-roam-induced crash burst leaves a trail.
+_NET_LOG_PATH = os.path.join(
+    os.path.expanduser("~"), "MuriTrading", "data", "bot", "jv2", "ws_network.log"
+)
+_NET_LOG_LOCK = threading.Lock()
+
+
+def _net_log(msg: str):
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        with _NET_LOG_LOCK:
+            with open(_NET_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"{ts}  {msg}\n")
+    except Exception:
+        pass
+
+
+def _network_reachable(host: str = "fstream.binance.com", port: int = 443,
+                       timeout: float = 3.0) -> bool:
+    """Quick TCP-reachability check before opening a WS. If this fails we
+    know the network is down (wifi roam in progress, no DNS, etc.) and we
+    should back off instead of slamming reconnects."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 
 # Per-symbol buffer: {perp_symbol: deque[(ts_ms, side, qty, price)]}
@@ -81,40 +115,73 @@ def _on_message(symbol: str, msg: str):
 
 
 def _run_ws_for_symbol(symbol: str):
-    """Daemon thread: open WS, listen, reconnect with backoff on disconnect."""
+    """Daemon thread: open WS, listen, reconnect with backoff on disconnect.
+
+    Hardened against wifi-roam / network-outage events:
+      - Outer BaseException catch so nothing propagates out of the thread
+        and kills the main process (SystemExit, KeyboardInterrupt, etc.)
+      - Pre-flight TCP reachability check before opening each WS — when
+        the network is down we long-back-off instead of slamming reconnects
+      - Per-reconnect and per-exception logging to ws_network.log so
+        post-mortem on a crash burst is possible
+    """
     if not HAVE_WS:
         return
     url = f"wss://fstream.binance.com/stream?streams={symbol.lower()}@forceOrder"
     backoff = 1.0
     stop = _STOP_FLAGS[symbol]
+    _net_log(f"{symbol} ws thread starting")
+
     while not stop.is_set():
         try:
+            # Pre-flight: if we can't even TCP-connect, network is broken.
+            # Long backoff (30s) rather than burst-retrying through a wifi roam.
+            if not _network_reachable():
+                _net_log(f"{symbol} network unreachable, sleeping 30s")
+                if stop.wait(30):
+                    break
+                continue
+
             ws = websocket.create_connection(url, timeout=15)
             ws.settimeout(60)
             backoff = 1.0
+            _net_log(f"{symbol} ws connected")
             while not stop.is_set():
                 try:
                     msg = ws.recv()
                     if msg:
                         _on_message(symbol, msg)
                 except websocket.WebSocketTimeoutException:
-                    # Send a ping-like idle
                     try:
                         ws.ping()
-                    except Exception:
+                    except BaseException as e:
+                        _net_log(f"{symbol} ping failed: {type(e).__name__}: {e}")
                         break
-                except websocket.WebSocketException:
+                except websocket.WebSocketException as e:
+                    _net_log(f"{symbol} ws exception: {type(e).__name__}: {e}")
+                    break
+                except BaseException as e:
+                    # Anything else (SSL renegotiation glitches, etc.) — log and reconnect
+                    _net_log(f"{symbol} recv unexpected: {type(e).__name__}: {e}")
                     break
             try:
                 ws.close()
-            except Exception:
+            except BaseException:
                 pass
-        except Exception:
-            pass
+        except BaseException as e:
+            # Connection attempt itself blew up. Log full traceback so we
+            # can see what kind of failure mode shows up during wifi roam.
+            tb = traceback.format_exc().splitlines()[-1] if traceback.format_exc() else ""
+            _net_log(f"{symbol} connect failed: {type(e).__name__}: {e} | {tb}")
+
         if stop.is_set():
             break
-        time.sleep(backoff)
+        # Use stop.wait instead of time.sleep so shutdown is responsive
+        if stop.wait(backoff):
+            break
         backoff = min(backoff * 2, 60.0)
+
+    _net_log(f"{symbol} ws thread exiting")
 
 
 def start_stream(symbol: str):
