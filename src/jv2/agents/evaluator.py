@@ -151,14 +151,15 @@ def build_signal_outcomes(df_4h_dict, signals_csv_path, trades_csv_path):
 
     # Signale laden
     signals = []
-    with open(signals_csv_path) as f:
+    # errors="replace": Alt-Daten aus der Windows-Ära enthalten cp1252-Bytes
+    with open(signals_csv_path, encoding="utf-8", errors="replace") as f:
         for row in csv.DictReader(f):
             signals.append(row)
 
     # Trades laden
     trades = []
     try:
-        with open(trades_csv_path) as f:
+        with open(trades_csv_path, encoding="utf-8", errors="replace") as f:
             for row in csv.DictReader(f):
                 trades.append(row)
     except FileNotFoundError:
