@@ -64,6 +64,56 @@ class InsightBus:
         self.file_lock = threading.Lock()
         # Map signal-id -> insight ref for outcome linking
         self.recent_by_bot: Dict[str, List[Insight]] = {}
+        # Tails aus dem JSONL rehydrieren, damit Outcome-Linking Restarts
+        # überlebt (vorher: in 6 Wochen nur 94 von ~579 Outcomes verknüpft,
+        # weil jeder Restart die In-Memory-Tails wegwarf — Audit 10.06.26).
+        self._rehydrate()
+
+    def _rehydrate(self, max_lines: int = 4000) -> None:
+        try:
+            with open(INSIGHTS_JSONL, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-max_lines:]
+        except OSError:
+            return
+        linked = set()
+        raw = []
+        for line in lines:
+            try:
+                d = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if d.get("outcome") is True:
+                linked.add((d.get("bot_id"), d.get("insight_generated_at")))
+            elif "direction" in d:
+                raw.append(d)
+        for d in raw:
+            try:
+                ins = Insight(
+                    bot_id=d["bot_id"], asset=d.get("asset", ""),
+                    direction=d.get("direction", "neutral"),
+                    confidence=float(d.get("confidence") or 0.0),
+                    reasoning=d.get("reasoning", ""),
+                    price_at_signal=float(d.get("price_at_signal") or 0.0),
+                    regime_cluster=int(d["regime_cluster"]) if d.get("regime_cluster") is not None else -1,
+                    half_life_candles=int(d.get("half_life_candles") or 6),
+                    generated_at=d.get("generated_at", ""),
+                    outcome_pnl=d.get("outcome_pnl"),
+                    outcome_hold=d.get("outcome_hold"),
+                    outcome_reason=d.get("outcome_reason"),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ins.outcome_pnl is None and (ins.bot_id, ins.generated_at) in linked:
+                # Bereits per Outcome-Zeile verknüpft — als belegt markieren,
+                # damit link_outcome() sie nicht erneut vergibt. Der echte
+                # PnL-Wert steht in der Outcome-Zeile im JSONL.
+                ins.outcome_pnl = 0.0
+                ins.outcome_reason = "rehydrated-linked"
+            self.buffer.append(ins)
+            tail = self.recent_by_bot.setdefault(ins.bot_id, [])
+            tail.append(ins)
+            if len(tail) > 50:
+                tail.pop(0)
 
     @classmethod
     def get(cls) -> "InsightBus":
@@ -93,15 +143,38 @@ class InsightBus:
 
     def link_outcome(self, bot_id: str, pnl: float, hold: int, reason: str,
                      match_window_minutes: int = 240) -> Optional[Insight]:
-        """Find the most recent non-neutral insight from `bot_id` whose
-        outcome is unset, and attach the outcome. Returns the linked insight."""
+        """Attach the outcome to the insight that originated the trade.
+
+        Der Trade lief `hold` Kerzen (à 4h) — das Ursprungs-Insight liegt also
+        ~hold*4h zurück. Vorher wurde stumpf das NEUESTE unverknüpfte Insight
+        genommen (= das der letzten Kerze, nicht das des Entries) — die
+        Outcome-Daten waren damit für den Meta-Learner wertlos (Audit 10.06.26).
+        Jetzt: unverknüpftes non-neutral Insight, dessen generated_at am
+        nächsten an (now - hold*4h) liegt, Toleranz ±match_window_minutes.
+        """
         tail = self.recent_by_bot.get(bot_id, [])
-        # Iterate newest-to-oldest
-        for ins in reversed(tail):
-            if ins.outcome_pnl is not None:
+        target = datetime.now(timezone.utc).timestamp() - hold * 14400
+        best = None
+        best_dist = match_window_minutes * 60
+        for ins in tail:
+            if ins.outcome_pnl is not None or ins.direction == "neutral":
                 continue
-            if ins.direction == "neutral":
+            try:
+                ts = datetime.fromisoformat(ins.generated_at).timestamp()
+            except (ValueError, TypeError):
                 continue
+            dist = abs(ts - target)
+            if dist <= best_dist:
+                best, best_dist = ins, dist
+        # Fallback: neuestes unverknüpftes Insight (altes Verhalten), damit
+        # bei Zeit-Anomalien weiterhin ein Outcome aufgezeichnet wird.
+        if best is None:
+            for ins in reversed(tail):
+                if ins.outcome_pnl is None and ins.direction != "neutral":
+                    best = ins
+                    break
+        if best is not None:
+            ins = best
             ins.outcome_pnl = pnl
             ins.outcome_hold = hold
             ins.outcome_reason = reason

@@ -178,9 +178,26 @@ class JV2Bot(ABC):
                     pass  # not in whitelist — no entry
                 else:
                     entry_info = self._open_position(
-                        signal, market_data["price"], market_data["atr_4h"], regime)
+                        signal, market_data["price"], market_data["atr_4h"], regime,
+                        drift=self._market_drift(market_data))
 
         return signal, entry_info, thesis_exit
+
+    # ── MARKET DRIFT (Market-Map-Regel) ───────────────
+    # +1 = 4H-Close über EMA50 (Aufwärts-Drift), -1 = darunter, 0 = unbekannt.
+    # Live-Evidenz 27.04-09.06.26: Counter-Drift-Longs n=286 WR 29.7% -$112,
+    # aligned Shorts n=111 WR 49.5% +$123. Counter-Drift-Entries werden
+    # deshalb in _open_position auf halbe Size gesetzt (Soft-Gate).
+    def _market_drift(self, market_data: dict) -> int:
+        try:
+            df = market_data.get("df_4h")
+            closes = df["close"]
+            if len(closes) < 20:
+                return 0
+            ema50 = closes.ewm(span=50, adjust=False).mean()
+            return 1 if float(closes.iloc[-1]) > float(ema50.iloc[-1]) else -1
+        except Exception:
+            return 0
 
     # ── REGIME SNAPSHOT ──────────────────────────────
     # Captured at entry time, persisted on the position, copied to TradeRecord at close.
@@ -226,7 +243,7 @@ class JV2Bot(ABC):
 
     # ── OPEN POSITION ────────────────────────────────
 
-    def _open_position(self, signal, price, atr, regime: dict = None):
+    def _open_position(self, signal, price, atr, regime: dict = None, drift: int = 0):
         rp = self.risk_profile
         # Katastrophen-Stop: weit weg (4 ATR), primärer Exit ist check_thesis()
         catastrophe_sl_atr = max(rp["sl_atr"], 4.0)
@@ -267,6 +284,14 @@ class JV2Bot(ABC):
         size_usd = risk_amount / sl_pct
         max_size = self.state.capital * leverage
         size_usd = min(size_usd, max_size)
+
+        # Drift-Gate (Soft): Entries gegen den 4H-EMA50-Drift halbieren.
+        if drift != 0:
+            dir_sgn = 1 if signal.direction == "long" else -1
+            if dir_sgn != drift:
+                size_usd *= 0.5
+                if regime is not None:
+                    regime["drift_counter"] = True
 
         if size_usd < 5.0:
             return None

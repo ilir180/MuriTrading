@@ -383,6 +383,16 @@ def main():
                     # Spy Intel (nur für Bots dieses Symbols)
                     sym_bots = bots_by_symbol[symbol]
                     spy_intel = spy.compile_intel(sym_bots, price)
+                    # Spy-Wirkung messbar machen: Intel pro Kerze loggen
+                    # (war definiert, aber nie aufgerufen — Audit 10.06.26)
+                    try:
+                        non_empty = {b: i for b, i in spy_intel.items() if i}
+                        if non_empty:
+                            append_spy_log(
+                                datetime.now(timezone.utc).isoformat(),
+                                {"symbol": symbol, "intel": non_empty})
+                    except Exception:
+                        pass
 
                     # Bots laufen lassen
                     for bot in sym_bots:

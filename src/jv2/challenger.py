@@ -214,6 +214,30 @@ def v2_decision(base_direction: str, base_confidence: float,
     return None, 0.0, "skip"
 
 
+def fair_size(state, sl_pct: float):
+    """Faires Sizing auf Cell-Basis + Exposure-Cap.
+
+    Der alte Code nutzte den GESAMT-Pool ($4000) statt Cell-Kapital —
+    16-64x oversized vs Baseline, dazu Klumpen aus bis zu 4 identischen
+    Positionen pro Symbol. Resultat: v1 -64%, v2 0/13 — der A/B-Test war
+    dadurch ungültig (Deep Dive 10.06.26). Jetzt: Cell-Kapital wie bei den
+    Baseline-Bots (Pool/32) und Gesamt-Exposure max 2x Kapital.
+    Returns size_usd oder None wenn kein Trade möglich.
+    """
+    if state.capital <= 0:
+        return None
+    cell_capital = state.capital / 32.0  # 8 Bots x 4 Assets
+    risk_amount = cell_capital * CHALLENGER_RISK_PER_TRADE
+    size_usd = risk_amount / sl_pct
+    size_usd = min(size_usd, cell_capital * CHALLENGER_LEVERAGE)
+    if size_usd < 5.0:
+        return None
+    open_exposure = sum(float(p.get("size_usd", 0)) for p in state.positions.values())
+    if open_exposure + size_usd > state.capital * 2.0:
+        return None
+    return size_usd
+
+
 # ── Trade lifecycle ──
 
 def on_signal(state: ChallengerState, bot_id: str, asset: str,
@@ -247,10 +271,8 @@ def on_signal(state: ChallengerState, bot_id: str, asset: str,
     sl_pct = abs(price - sl) / price
     if sl_pct < 0.001:
         sl_pct = 0.01
-    risk_amount = state.capital * CHALLENGER_RISK_PER_TRADE
-    size_usd = risk_amount / sl_pct
-    size_usd = min(size_usd, state.capital * CHALLENGER_LEVERAGE)
-    if size_usd < 5.0:
+    size_usd = fair_size(state, sl_pct)
+    if size_usd is None:
         return False
 
     pos = ChallengerPosition(
@@ -368,10 +390,8 @@ def on_signal_v2(state: ChallengerState, bot_id: str, asset: str,
     sl_pct = abs(price - sl) / price
     if sl_pct < 0.001:
         sl_pct = 0.01
-    risk_amount = state.capital * CHALLENGER_RISK_PER_TRADE
-    size_usd = risk_amount / sl_pct
-    size_usd = min(size_usd, state.capital * CHALLENGER_LEVERAGE)
-    if size_usd < 5.0:
+    size_usd = fair_size(state, sl_pct)
+    if size_usd is None:
         return False
 
     pos = ChallengerPosition(
