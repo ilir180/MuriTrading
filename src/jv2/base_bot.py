@@ -286,7 +286,10 @@ class JV2Bot(ABC):
         size_usd = min(size_usd, max_size)
 
         # Drift-Gate (Soft): Entries gegen den 4H-EMA50-Drift halbieren.
-        if drift != 0:
+        # Ausnahme momentum_surfer: seine Counter-Drift-Trades sind profitabel
+        # (48.6% WR, +$17 — sein Velocity-Signal fängt Reversals früh, das
+        # Gate würde -$8.7 kosten; Deep Dive 10.06.26 Abschnitt X).
+        if drift != 0 and self.base_id != "momentum_surfer":
             dir_sgn = 1 if signal.direction == "long" else -1
             if dir_sgn != drift:
                 size_usd *= 0.5

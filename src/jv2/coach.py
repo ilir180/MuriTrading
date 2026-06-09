@@ -31,7 +31,7 @@ import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from src.jv2.config import (
@@ -67,7 +67,12 @@ WR_INVERT_REGIME_BAD          = 0.0001  # i.e. 0 wins
 PF_PROMOTE_THRESHOLD     = 1.20  # profit factor
 
 # Counterfactual is supporting evidence, not primary. Weight ratio:
-CF_WEIGHT_RATIO          = 0.3   # blend = 0.7*live + 0.3*cf when both present
+# Deep Dive 10.06.26: CF-WR vs Live-WR über 12 Cells hat r = -0.04 (NULL
+# Vorhersagekraft) — die 4-Jahre-CF beschreibt einen anderen Markt (ATR-Median
+# 1.8 vs live 1.3). Deshalb: Gewicht 0.3 -> 0.15 UND CF auf die letzten
+# 12 Monate beschränkt (CF_RECENCY_CUTOFF_DAYS).
+CF_WEIGHT_RATIO          = 0.15  # blend = 0.85*live + 0.15*cf when both present
+CF_RECENCY_CUTOFF_DAYS   = 365   # nur CF-Trades der letzten 12 Monate zählen
 
 # Hysteresis: an existing action stays unless the new evaluation has at
 # least this confidence. Prevents weekly whiplash (Champion -> Keep -> Champion).
@@ -175,7 +180,8 @@ def _load_trades(path: str) -> List[dict]:
     if not os.path.exists(path):
         return []
     rows = []
-    with open(path, newline="") as f:
+    # errors="replace": Alt-Daten aus der Windows-Ära enthalten cp1252-Bytes
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
         for row in csv.DictReader(f):
             rows.append(row)
     return rows
@@ -542,6 +548,10 @@ class Coach:
         """
         live_trades = _load_trades(self.trades_path)
         cf_trades = _load_trades(self.cf_path)
+        # Recency-Filter: alte CF-Trades beschreiben einen anderen Markt.
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=CF_RECENCY_CUTOFF_DAYS)).isoformat()
+        cf_trades = [t for t in cf_trades if (t.get("timestamp") or "") >= cutoff]
         live_stats = _aggregate(live_trades)
         cf_stats = _aggregate(cf_trades)
 
