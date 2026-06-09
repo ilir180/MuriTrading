@@ -52,33 +52,41 @@ st.capital = -10
 assert ch.fair_size(st, 0.05) is None, "Bankruptcy-Guard griff nicht"
 print("3c) Bankruptcy-Guard greift OK")
 
-# ── 4) trend_rider Hysterese ──
+# ── 4) trend_rider Hysterese (nur-ADX-Thesis seit Variante A) ──
 from src.jv2.bots.trend_rider import TrendRider
 tr = TrendRider("XRP/USDT")
 class FakePos:
     direction = "long"
 tr.state.position = FakePos()
-md_bad = {"latest_4h": {"4h_adx": 30, "4h_ema_9_above_21": 0.0}}
+md_bad = {"latest_4h": {"4h_adx": 10, "4h_ema_9_above_21": 0.0}}
+md_emacross = {"latest_4h": {"4h_adx": 30, "4h_ema_9_above_21": 0.0}}
+ok0, _ = tr.check_thesis(md_emacross)
+ok0b, _ = tr.check_thesis(md_emacross)
+assert ok0 and ok0b, "EMA-Cross darf nicht mehr exiten"
+print("4) trend_rider: EMA-Cross exitet nicht mehr OK")
 ok1, _ = tr.check_thesis(md_bad)
 ok2, why2 = tr.check_thesis(md_bad)
-assert ok1 is True and ok2 is False, f"Hysterese falsch: {ok1}/{ok2}"
-print(f"4) trend_rider: 1. Gegen-Kerze toleriert, 2. exitet ('{why2}') OK")
+assert ok1 is True and ok2 is False, f"ADX-Hysterese falsch: {ok1}/{ok2}"
+print(f"4b) ADX<15: 1. Kerze toleriert, 2. exitet ('{why2}') OK")
 tr.state.position = FakePos()
 ok3, _ = tr.check_thesis(md_bad)
 md_good = {"latest_4h": {"4h_adx": 30, "4h_ema_9_above_21": 1.0}}
 ok4, _ = tr.check_thesis(md_good)
 ok5, _ = tr.check_thesis(md_bad)
 assert ok3 and ok4 and ok5, "Strike-Reset bei gültiger Kerze fehlt"
-print("4b) Strike-Reset nach gültiger Kerze OK")
+print("4c) Strike-Reset nach gültiger Kerze OK")
 
-# ── 5) Drift-Gate ──
+# ── 5) Drift-Gate (nur STARKER Drift, >1 ATR vom EMA50) ──
 import pandas as pd
-closes_up = pd.DataFrame({"close": [1.0 + i * 0.01 for i in range(60)]})
-closes_dn = pd.DataFrame({"close": [2.0 - i * 0.01 for i in range(60)]})
-assert tr._market_drift({"df_4h": closes_up}) == 1
-assert tr._market_drift({"df_4h": closes_dn}) == -1
+closes_up = pd.DataFrame({"close": [1.0 + i * 0.05 for i in range(80)]})
+closes_dn = pd.DataFrame({"close": [6.0 - i * 0.05 for i in range(80)]})
+closes_flat = pd.DataFrame({"close": [1.0] * 80})
+assert tr._market_drift({"df_4h": closes_up, "atr_4h": 0.05}) == 1
+assert tr._market_drift({"df_4h": closes_dn, "atr_4h": 0.05}) == -1
+assert tr._market_drift({"df_4h": closes_flat, "atr_4h": 0.05}) == 0, "schwacher Drift muss 0 sein"
+assert tr._market_drift({"df_4h": closes_up, "atr_4h": 99.0}) == 0, "Distanz < 1 ATR muss 0 sein"
 assert tr._market_drift({}) == 0
-print("5) _market_drift: up=+1, down=-1, fehlend=0 OK")
+print("5) _market_drift: stark up=+1, stark down=-1, schwach/fehlend=0 OK")
 
 # size-Halbierung
 sig_type = type("S", (), {"direction": "long", "confidence": 0.6})

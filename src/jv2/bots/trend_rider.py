@@ -13,12 +13,14 @@ class TrendRider(JV2Bot):
         self._thesis_strikes = 0
 
     def check_thesis(self, market_data):
-        """Trend gilt noch wenn ADX > 15 und EMA-Alignment Richtung bestätigt.
+        """Trend gilt noch solange ADX > 15 (mit 2-Kerzen-Hysterese).
 
-        Hysterese: Invalidierung muss 2 Kerzen in Folge bestehen. Exit-Replay
-        (Deep Dive 10.06.26, 549 Trades auf 5m-Kerzen) zeigte: Sofort-Exit auf
-        eine einzelne Gegen-Kerze kostete -$52 vs +$52 ohne Thesis-Exit —
-        der Trailing-Stop fängt echte Trendbrüche, die EMA-Kreuzung ist Noise.
+        Die frühere EMA-Cross-Bedingung ist bewusst ENTFERNT: Exit-Replay
+        (Deep Dive 10.06.26, 146 trend_rider-Trades auf echten Kerzen) zeigte
+        im selben Replay-Engine: mit EMA-Cross-Exit +$28, mit Hysterese +$38,
+        NUR-ADX +$115 bei WR 62% — die EMA-Kreuzung ist 4H-Noise, echte
+        Trendbrüche fängt der Trailing-Stop. ADX-Tod bleibt als Exit (rettet
+        Trades vor dem TIME-Exit im toten Markt).
         """
         if not self.state.position:
             self._thesis_strikes = 0
@@ -27,21 +29,13 @@ class TrendRider(JV2Bot):
         if r4 is None:
             return True, ""
         adx = _safe(r4.get("4h_adx", 0))
-        ema9_21 = _safe(r4.get("4h_ema_9_above_21", 0.5))
-        breach = None
-        if adx < 15:
-            breach = f"Trend tot (ADX:{adx:.0f})"
-        elif self.state.position.direction == "long" and ema9_21 < 0.5:
-            breach = "EMA-Cross bearish"
-        elif self.state.position.direction == "short" and ema9_21 > 0.5:
-            breach = "EMA-Cross bullish"
-        if breach is None:
+        if adx >= 15:
             self._thesis_strikes = 0
             return True, ""
         self._thesis_strikes += 1
         if self._thesis_strikes >= 2:
             self._thesis_strikes = 0
-            return False, f"{breach} (2 Kerzen bestätigt)"
+            return False, f"Trend tot (ADX:{adx:.0f}, 2 Kerzen bestätigt)"
         return True, ""
 
     def generate_signal(self, market_data, spy_intel):

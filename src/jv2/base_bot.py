@@ -184,18 +184,28 @@ class JV2Bot(ABC):
         return signal, entry_info, thesis_exit
 
     # ── MARKET DRIFT (Market-Map-Regel) ───────────────
-    # +1 = 4H-Close über EMA50 (Aufwärts-Drift), -1 = darunter, 0 = unbekannt.
-    # Live-Evidenz 27.04-09.06.26: Counter-Drift-Longs n=286 WR 29.7% -$112,
-    # aligned Shorts n=111 WR 49.5% +$123. Counter-Drift-Entries werden
-    # deshalb in _open_position auf halbe Size gesetzt (Soft-Gate).
+    # +1 = STARKER Aufwärts-Drift (4H-Close > EMA50 + 1 ATR), -1 = starker
+    # Abwärts-Drift, 0 = schwach/unbekannt (kein Gate).
+    # Walk-Forward-Validierung (Deep Dive 10.06.26): Counter-Trades bei
+    # STARKEM Drift verlieren in BEIDEN Datenhälften (-$4 / -$109, n=287),
+    # bei schwachem Drift sind sie Noise (+$12). Nur starker Drift gatet —
+    # das eliminiert die Chop-Kosten des naiven Gates (H1: -$10).
     def _market_drift(self, market_data: dict) -> int:
         try:
             df = market_data.get("df_4h")
             closes = df["close"]
             if len(closes) < 20:
                 return 0
-            ema50 = closes.ewm(span=50, adjust=False).mean()
-            return 1 if float(closes.iloc[-1]) > float(ema50.iloc[-1]) else -1
+            atr = float(market_data.get("atr_4h") or 0)
+            if atr <= 0:
+                return 0
+            ema50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+            dist = float(closes.iloc[-1]) - ema50
+            if dist > atr:
+                return 1
+            if dist < -atr:
+                return -1
+            return 0
         except Exception:
             return 0
 
