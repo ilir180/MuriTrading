@@ -171,11 +171,16 @@ class JV2Bot(ABC):
                 regime = self._snapshot_regime(market_data)
                 # Coach regime gating
                 cluster = regime.get("cluster", -1)
+                heat = (market_data.get("open_same_dir") or {}).get(signal.direction, 0)
                 if cluster in self.regime_blacklist:
                     pass  # gated off — no entry
                 elif (self.regime_whitelist is not None
                       and cluster not in self.regime_whitelist):
                     pass  # not in whitelist — no entry
+                elif heat >= 3:
+                    # Heat-Cap: schon 3 gleichgerichtete Positionen in diesem
+                    # Symbol offen — die 4.+ war historisch toxisch (WR 23-39%).
+                    pass
                 else:
                     entry_info = self._open_position(
                         signal, market_data["price"], market_data["atr_4h"], regime,

@@ -394,12 +394,23 @@ def main():
                     except Exception:
                         pass
 
+                    # Heat-Zähler: offene Positionen pro Richtung in diesem
+                    # Symbol. base_bot skippt Entries ab 3 gleichgerichteten
+                    # (4.+ Position: WR 23-39%, -$46 — Deep Dive 10.06.26).
+                    open_same_dir = {"long": 0, "short": 0}
+                    for b in sym_bots:
+                        if b.state.position:
+                            open_same_dir[b.state.position.direction] += 1
+                    market_data["open_same_dir"] = open_same_dir
+
                     # Bots laufen lassen
                     for bot in sym_bots:
                         try:
                             signal, entry_info, thesis_exit = bot.on_new_candle(
                                 market_data, spy_intel.get(bot.bot_id, {}))
                             append_signal(signal)
+                            if entry_info and bot.state.position:
+                                open_same_dir[bot.state.position.direction] += 1
 
                             cfg = BOT_CONFIGS.get(bot.base_id, {})
                             emoji = cfg.get("emoji", "")
