@@ -14,6 +14,7 @@ if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 }
 
-# pyenv-win shim resolves Python via .python-version (3.11.9).
+# Absoluter Pfad statt PATH-Lookup: C:\Python314 schattet seit 10.06. den pyenv-Shim ab.
 # cmd /c handles stdout+stderr redirection cleanly (avoids PS 5.1 NativeCommandError wrapping).
-cmd /c "python src\jv2\runner.py >> data\bot\jv2\jv2_output.log 2>&1"
+$Python = 'C:\Users\ilir_\.pyenv\pyenv-win\versions\3.11.9\python.exe'
+cmd /c "`"$Python`" src\jv2\runner.py >> data\bot\jv2\jv2_output.log 2>&1"
