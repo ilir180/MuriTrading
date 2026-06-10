@@ -288,7 +288,8 @@ def main():
                     had_close = True
                     append_trade(trade)
                     sym_short = SYMBOLS.get(bot.symbol, {}).get("short", "?")
-                    log(f"\u274C CLOSE {bot.bot_id} [{sym_short}] {trade.direction.upper()} "
+                    close_emoji = "\u2705" if trade.pnl > 0 else "\u274C"
+                    log(f"{close_emoji} CLOSE {bot.bot_id} [{sym_short}] {trade.direction.upper()} "
                         f"[{trade.reason}] PnL:${trade.pnl:+.2f}",
                         C.GREEN if trade.pnl > 0 else C.RED)
                     tg_send(fmt_trade_close(trade))
