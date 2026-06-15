@@ -232,7 +232,7 @@ class JV2Bot(ABC):
             "atr_pct": (atr / price * 100) if price > 0 else 0.0,
             "chop": _safe(r4.get("4h_chop")),
             "trend_consistency": _safe(r4.get("4h_trend_consistency")),
-            "fear_greed": _safe(sent.get("fear_greed"), 50.0),
+            "fear_greed": _safe(sent.get("sent_fear_greed"), 50.0),
         }
         regime["cluster"] = _get_clusterer().assign(regime)
         return regime
